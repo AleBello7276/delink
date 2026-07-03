@@ -148,8 +148,7 @@ impl PeGlobalSymbols {
                 end = Some(i);
                 break;
             }
-            let printable =
-                matches!(b, b'\t' | b'\n' | b'\r') || (0x20..=0x7E).contains(&b);
+            let printable = matches!(b, b'\t' | b'\n' | b'\r') || (0x20..=0x7E).contains(&b);
             if !printable {
                 return None;
             }
@@ -201,7 +200,9 @@ impl delink_x86_64::recover::SymbolResolver for PeGlobalSymbols {
     }
 
     fn resolve_tls_offset(&self, offset: u32) -> Option<(String, i64)> {
-        self.tls_variables.get(&offset).map(|name| (name.clone(), 0))
+        self.tls_variables
+            .get(&offset)
+            .map(|name| (name.clone(), 0))
     }
 }
 

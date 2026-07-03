@@ -111,11 +111,11 @@ const MAX_TEXT_BYTES: usize = 32;
 pub fn narrow_string_symbol(content: &[u8]) -> String {
     // Length and CRC are over the bytes including the NUL terminator.
     let total_len = content.len() as u32 + 1;
-    // CRC over content + NUL, without allocating a joined buffer.
+    // CRC over content + NUL, without allocating a joined buffer: fold the
+    // trailing NUL byte (`c ^ 0 == c`) through one more table step.
     let crc = {
-        let mut c = msvc_string_crc(content);
-        c = CRC32_TABLE[((c ^ 0) & 0xFF) as usize] ^ (c >> 8);
-        c
+        let c = msvc_string_crc(content);
+        CRC32_TABLE[(c & 0xFF) as usize] ^ (c >> 8)
     };
 
     let mut out = String::from("??_C@_0");
@@ -149,11 +149,22 @@ mod tests {
             (b"system", "??_C@_06FHFOAHML@system?$AA@"),
             (b"generic", "??_C@_07DCLBNMLN@generic?$AA@"),
             (b"iostream", "??_C@_08LLGCOLLL@iostream?$AA@"),
-            (b"tag_resource_lruv", "??_C@_0BC@DKEHMPJE@tag_resource_lruv?$AA@"),
-            (b"string too long", "??_C@_0BA@JFNIOLAK@string?5too?5long?$AA@"),
+            (
+                b"tag_resource_lruv",
+                "??_C@_0BC@DKEHMPJE@tag_resource_lruv?$AA@",
+            ),
+            (
+                b"string too long",
+                "??_C@_0BA@JFNIOLAK@string?5too?5long?$AA@",
+            ),
         ];
         for (content, expected) in cases {
-            assert_eq!(&narrow_string_symbol(content), expected, "content = {:?}", content);
+            assert_eq!(
+                &narrow_string_symbol(content),
+                expected,
+                "content = {:?}",
+                content
+            );
         }
     }
 
