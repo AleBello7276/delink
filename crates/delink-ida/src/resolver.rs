@@ -172,4 +172,9 @@ impl delink_x86_64::recover::SymbolResolver for IdaSymbols {
     fn resolve_data(&self, va: u64) -> Option<(String, i64)> {
         IdaSymbols::resolve_data(self, va)
     }
+    // image_base()/in_text() intentionally use the trait defaults: image-base-
+    // relative recovery (jump tables, ADDR32NB) is PE/COFF-specific and this
+    // format-generic path (COFF/ELF × x86/x86-64) can't represent it. The
+    // defaults (u64::MAX / false) keep the recovery pass from emitting relocs
+    // this emit would drop. See delink-pe for the PE-side implementation.
 }
