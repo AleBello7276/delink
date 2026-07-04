@@ -22,6 +22,8 @@ use crate::{BaseRelocKind, PeArch, PeContext, PeSection};
 
 // AMD64 relocation type constants.
 const REL_AMD64_ADDR64: u16 = object::pe::IMAGE_REL_AMD64_ADDR64;
+const REL_AMD64_ADDR32NB: u16 = object::pe::IMAGE_REL_AMD64_ADDR32NB;
+const REL_AMD64_SECREL: u16 = object::pe::IMAGE_REL_AMD64_SECREL;
 const REL_AMD64_REL32: u16 = object::pe::IMAGE_REL_AMD64_REL32;
 
 // I386 relocation type constants.
@@ -138,7 +140,9 @@ pub fn emit_pe_cu(pe: &PeContext, cu: &PeCompilationUnit, out_path: &Path) -> Re
                 for r in &recovery.relocs {
                     let off = r.offset as usize;
                     let zero_len = match r.kind {
-                        delink_x86_64::RelocKind::Rel32 => 4,
+                        delink_x86_64::RelocKind::Rel32 { .. } => 4,
+                        delink_x86_64::RelocKind::Addr32Nb => 4,
+                        delink_x86_64::RelocKind::Secrel => 4,
                         delink_x86_64::RelocKind::Addr64 => 8,
                     };
                     if off + zero_len <= fn_bytes.len() {
@@ -224,20 +228,49 @@ pub fn emit_pe_cu(pe: &PeContext, cu: &PeCompilationUnit, out_path: &Path) -> Re
                     total_relocs += 1;
                 }
 
+                // Emit a data symbol at each recovered jump table. Besides giving
+                // the table entries a home, this symbol bounds the function in
+                // objdiff (which otherwise disassembles the table as trailing code).
+                for jt in &recovery.jump_tables {
+                    let jt_id = obj.add_symbol(Symbol {
+                        name: sanitize_symbol_name(&jt.name),
+                        value: fn_offset + jt.offset,
+                        size: jt.entry_count * 4,
+                        kind: SymbolKind::Data,
+                        scope: SymbolScope::Compilation,
+                        weak: false,
+                        section: SymbolSection::Section(sid),
+                        flags: SymbolFlags::None,
+                    });
+                    local_syms.insert(jt.name.clone(), jt_id);
+                }
+
                 for r in &recovery.relocs {
                     let sym_id = resolve_symbol(&mut obj, &local_syms, &mut undef_cache, &r.target);
+                    // The REL32/REL32_1..REL32_5 type constants are consecutive, so
+                    // the trailing-immediate width both selects the type and extends
+                    // the PC-relative bias the object writer folds into the field
+                    // (REL32 → +4, REL32_1 → +5, …); subtract it so the written field
+                    // lands at the intended addend. ADDR32NB (RVA) gets no bias.
+                    let (typ, addend) = match r.kind {
+                        delink_x86_64::RelocKind::Rel32 { trailing } => (
+                            REL_AMD64_REL32 + trailing as u16,
+                            r.addend - REL32_FIELD_BYTES - trailing as i64,
+                        ),
+                        delink_x86_64::RelocKind::Addr32Nb => (REL_AMD64_ADDR32NB, r.addend),
+                        delink_x86_64::RelocKind::Secrel => (REL_AMD64_SECREL, r.addend),
+                        delink_x86_64::RelocKind::Addr64 => (REL_AMD64_ADDR64, r.addend),
+                    };
                     obj.add_relocation(
                         sid,
                         Relocation {
                             offset: fn_offset + r.offset,
                             symbol: sym_id,
-                            addend: r.addend - REL32_FIELD_BYTES,
-                            flags: RelocationFlags::Coff {
-                                typ: REL_AMD64_REL32,
-                            },
+                            addend,
+                            flags: RelocationFlags::Coff { typ },
                         },
                     )
-                    .with_context(|| format!("add rel32 reloc at {:#x}", r.offset))?;
+                    .with_context(|| format!("add reloc at {:#x}", r.offset))?;
                     total_relocs += 1;
                 }
             }

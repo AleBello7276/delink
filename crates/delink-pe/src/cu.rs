@@ -103,6 +103,7 @@ type CuIndexResult = (
     PeCuIndex,
     BTreeMap<u64, PeFunction>,
     BTreeMap<u64, PeVariable>,
+    BTreeMap<u32, String>,
     Vec<String>,
 );
 
@@ -158,20 +159,50 @@ pub fn build_cu_index(
     // separately so they can fill gaps where no S_GDATA32/S_LDATA32 exists.
     let mut mangled_by_va: HashMap<u64, String> = HashMap::new();
     let mut public_data_by_va: HashMap<u64, String> = HashMap::new();
+    // Thread-local variables: `.tls` section-relative offset → mangled name,
+    // used to recover SECREL relocations on `mov r32, <tls-offset>` loads.
+    // Global TLS (`S_GTHREAD32`) lives in the global stream; file-static TLS
+    // (`S_LTHREAD32`) is collected from the module streams below.
+    let mut tls_variables: BTreeMap<u32, String> = BTreeMap::new();
     {
+        // Public (S_PUB32) names, keyed by section:offset, so a TLS variable's
+        // ThreadStorage record (which carries the undecorated name) can be paired
+        // with the decorated/mangled public name that the code actually references.
+        let mut pub_by_secoff: HashMap<(u16, u32), String> = HashMap::new();
+        let mut tls_pending: Vec<(u16, u32, String)> = Vec::new();
         let global_syms = pdb.global_symbols().context("PDB global symbols")?;
         let mut iter = global_syms.iter();
         while let Some(sym) = iter.next()? {
-            if let Ok(pdb::SymbolData::Public(p)) = sym.parse() {
-                if let Some(rva) = p.offset.to_rva(&address_map) {
-                    let va = image_base + rva.0 as u64;
+            match sym.parse() {
+                Ok(pdb::SymbolData::Public(p)) => {
                     let name = p.name.to_string().into_owned();
-                    mangled_by_va.insert(va, name.clone());
-                    if !p.function && !p.code {
-                        public_data_by_va.insert(va, name);
+                    pub_by_secoff
+                        .entry((p.offset.section, p.offset.offset))
+                        .or_insert_with(|| name.clone());
+                    if let Some(rva) = p.offset.to_rva(&address_map) {
+                        let va = image_base + rva.0 as u64;
+                        mangled_by_va.insert(va, name.clone());
+                        if !p.function && !p.code {
+                            public_data_by_va.insert(va, name);
+                        }
                     }
                 }
+                Ok(pdb::SymbolData::ThreadStorage(t)) => {
+                    tls_pending.push((
+                        t.offset.section,
+                        t.offset.offset,
+                        t.name.to_string().into_owned(),
+                    ));
+                }
+                _ => {}
             }
+        }
+        for (section, offset, fallback) in tls_pending {
+            let name = pub_by_secoff
+                .get(&(section, offset))
+                .cloned()
+                .unwrap_or(fallback);
+            tls_variables.entry(offset).or_insert(name);
         }
     }
 
@@ -275,6 +306,13 @@ pub fn build_cu_index(
                         };
                         all_variables.entry(va).or_insert_with(|| v);
                     }
+                    Ok(pdb::SymbolData::ThreadStorage(t)) => {
+                        // TLS variables live in `.tls`; key by the section-relative
+                        // offset, which is exactly the SECREL value the linker bakes
+                        // into `mov r32, <tls-offset>`.
+                        let name = t.name.to_string().into_owned();
+                        tls_variables.entry(t.offset.offset).or_insert(name);
+                    }
                     Ok(pdb::SymbolData::Label(l)) => {
                         let Some(rva) = l.offset.to_rva(&address_map) else {
                             continue;
@@ -346,6 +384,7 @@ pub fn build_cu_index(
         PeCuIndex { units },
         all_functions,
         all_variables,
+        tls_variables,
         inlined_functions.into_iter().collect(),
     ))
 }
