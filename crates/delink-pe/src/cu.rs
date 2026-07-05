@@ -107,6 +107,7 @@ type CuIndexResult = (
     BTreeMap<u64, PeFunction>,
     BTreeMap<u64, PeVariable>,
     BTreeMap<u32, String>,
+    BTreeMap<u64, String>,
     Vec<String>,
 );
 
@@ -179,6 +180,9 @@ pub fn build_cu_index(
     // separately so they can fill gaps where no S_GDATA32/S_LDATA32 exists.
     let mut mangled_by_va: HashMap<u64, String> = HashMap::new();
     let mut public_data_by_va: HashMap<u64, String> = HashMap::new();
+    // Public code symbols with no per-module procedure record (statically-linked
+    // CRT helpers like `memcpy`), so call targets into them still resolve.
+    let mut public_code_by_va: HashMap<u64, String> = HashMap::new();
     // Thread-local variables: `.tls` section-relative offset → mangled name,
     // used to recover SECREL relocations on `mov r32, <tls-offset>` loads.
     // Global TLS (`S_GTHREAD32`) lives in the global stream; file-static TLS
@@ -202,7 +206,9 @@ pub fn build_cu_index(
                     if let Some(rva) = p.offset.to_rva(&address_map) {
                         let va = image_base + rva.0 as u64;
                         mangled_by_va.insert(va, name.clone());
-                        if !p.function && !p.code {
+                        if p.function || p.code {
+                            public_code_by_va.insert(va, name);
+                        } else {
                             public_data_by_va.insert(va, name);
                         }
                     }
@@ -407,11 +413,19 @@ pub fn build_cu_index(
         });
     }
 
+    // Public code symbols with no procedure record (e.g. statically-linked CRT
+    // routines), keyed by VA, for resolve_code call-target fallback.
+    let code_publics: BTreeMap<u64, String> = public_code_by_va
+        .into_iter()
+        .filter(|(va, _)| !all_functions.contains_key(va))
+        .collect();
+
     Ok((
         PeCuIndex { units },
         all_functions,
         all_variables,
         tls_variables,
+        code_publics,
         inlined_functions.into_iter().collect(),
     ))
 }

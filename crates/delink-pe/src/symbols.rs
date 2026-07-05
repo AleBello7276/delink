@@ -15,6 +15,9 @@ pub struct PeGlobalSymbols {
     pub variables: BTreeMap<u64, PeVariable>,
     /// `.tls` section-relative offset → thread-local variable name (SECREL target).
     pub tls_variables: BTreeMap<u32, String>,
+    /// VA → public code symbol name with no per-module procedure record
+    /// (statically-linked CRT routines like `memcpy`). Fallback for call targets.
+    pub code_publics: BTreeMap<u64, String>,
     /// IAT slot VA → `"__imp_funcname"` (from PE import table).
     pub imports: HashMap<u64, String>,
     /// Well-known data section ranges for section-relative fallbacks.
@@ -34,6 +37,7 @@ impl PeGlobalSymbols {
         functions: BTreeMap<u64, PeFunction>,
         variables: BTreeMap<u64, PeVariable>,
         tls_variables: BTreeMap<u32, String>,
+        code_publics: BTreeMap<u64, String>,
         imports: &HashMap<u64, String>,
         sections: &[PeSection],
         image_base: u64,
@@ -55,6 +59,7 @@ impl PeGlobalSymbols {
             functions,
             variables,
             tls_variables,
+            code_publics,
             imports: imports.clone(),
             text_range: section_range(".text"),
             rdata_range: section_range(".rdata"),
@@ -80,6 +85,23 @@ impl PeGlobalSymbols {
         // IAT thunk (indirect calls via __imp_*).
         if let Some(name) = self.imports.get(&va) {
             return Some((name.clone(), 0));
+        }
+        // Public code symbol with no procedure record (e.g. `memcpy`). Exact
+        // start, or interior bounded by the next such symbol.
+        if let Some(name) = self.code_publics.get(&va) {
+            return Some((name.clone(), 0));
+        }
+        if let Some((start, name)) = self.code_publics.range(..=va).next_back() {
+            let next = self
+                .code_publics
+                .range((*start + 1)..)
+                .next()
+                .map(|(n, _)| *n)
+                .unwrap_or(u64::MAX);
+            let sec_end = self.text_range.as_ref().map(|r| r.end).unwrap_or(u64::MAX);
+            if va < next.min(sec_end) {
+                return Some((name.clone(), (va - *start) as i64));
+            }
         }
         None
     }
