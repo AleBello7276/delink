@@ -137,21 +137,36 @@ pub fn build_cu_index(
     let type_information = pdb.type_information().ok();
     let mut type_finder = type_information.as_ref().map(|ti| ti.finder());
     let mut stdcall_param_bytes: HashMap<pdb::TypeIndex, u32> = HashMap::new();
+    // Complete class/union sizes keyed by mangled unique name, so a forward
+    // reference (size 0) on a data global's type can be resolved to the real
+    // definition and its interior references bounded correctly.
+    let mut udt_sizes: HashMap<String, u32> = HashMap::new();
     if let (Some(ti), Some(finder)) = (type_information.as_ref(), type_finder.as_mut()) {
         let mut iter = ti.iter();
         while let Ok(Some(typ)) = iter.next() {
             finder.update(&iter);
-            if matches!(arch, PeArch::X86) {
-                if let Ok(pdb::TypeData::Procedure(proc)) = typ.parse() {
+            match typ.parse() {
+                Ok(pdb::TypeData::Procedure(proc)) if matches!(arch, PeArch::X86) => {
                     if proc.attributes.calling_convention() == CV_CALL_NEAR_STD {
                         let bytes = x86_proc_param_bytes(finder, proc.argument_list);
                         stdcall_param_bytes.insert(typ.index(), bytes);
                     }
                 }
+                Ok(pdb::TypeData::Class(c)) if !c.properties.forward_reference() && c.size > 0 => {
+                    if let Some(un) = c.unique_name {
+                        udt_sizes.insert(un.to_string().into_owned(), c.size as u32);
+                    }
+                }
+                Ok(pdb::TypeData::Union(u)) if !u.properties.forward_reference() && u.size > 0 => {
+                    if let Some(un) = u.unique_name {
+                        udt_sizes.insert(un.to_string().into_owned(), u.size as u32);
+                    }
+                }
+                _ => {}
             }
         }
     }
-    // Immutable view for the data-sizing lookups below.
+    // Immutable views for the data-sizing lookups below.
     let type_finder = type_finder;
 
     let dbi = pdb.debug_information().context("PDB debug information")?;
@@ -306,7 +321,7 @@ pub fn build_cu_index(
                         });
                         let size = type_finder
                             .as_ref()
-                            .map(|f| type_byte_size(f, d.type_index, arch))
+                            .map(|f| type_byte_size(f, d.type_index, arch, &udt_sizes))
                             .unwrap_or(0);
                         let v = PeVariable {
                             name,
@@ -415,14 +430,29 @@ fn section_name_for_va(sections: &[PeSection], va: u64) -> String {
 
 /// Byte size of a PDB type, for bounding interior references into data globals.
 /// Returns 0 when unknown (interior resolution is then skipped).
-fn type_byte_size(finder: &pdb::TypeFinder<'_>, idx: pdb::TypeIndex, arch: PeArch) -> u32 {
+fn type_byte_size(
+    finder: &pdb::TypeFinder<'_>,
+    idx: pdb::TypeIndex,
+    arch: PeArch,
+    udt_sizes: &HashMap<String, u32>,
+) -> u32 {
     let ptr = if matches!(arch, PeArch::X86) { 4 } else { 8 };
     let Ok(t) = finder.find(idx) else {
         return 0;
     };
+    // A forward-referenced class/union has size 0; recover it from the complete
+    // definition collected by unique name.
+    let complete = |size: u64, name: Option<pdb::RawString<'_>>| -> u32 {
+        if size > 0 {
+            size as u32
+        } else {
+            name.and_then(|n| udt_sizes.get(&n.to_string().into_owned()).copied())
+                .unwrap_or(0)
+        }
+    };
     match t.parse() {
-        Ok(pdb::TypeData::Class(c)) => c.size as u32,
-        Ok(pdb::TypeData::Union(u)) => u.size as u32,
+        Ok(pdb::TypeData::Class(c)) => complete(c.size, c.unique_name),
+        Ok(pdb::TypeData::Union(u)) => complete(u.size, u.unique_name),
         // Dimensions are cumulative byte sizes; the last is the whole array.
         Ok(pdb::TypeData::Array(a)) => a.dimensions.last().copied().unwrap_or(0),
         Ok(pdb::TypeData::Pointer(_)) => ptr,
@@ -433,9 +463,15 @@ fn type_byte_size(finder: &pdb::TypeFinder<'_>, idx: pdb::TypeIndex, arch: PeArc
                 primitive_byte_size(p.kind)
             }
         }
-        Ok(pdb::TypeData::Enumeration(e)) => type_byte_size(finder, e.underlying_type, arch),
-        Ok(pdb::TypeData::Modifier(m)) => type_byte_size(finder, m.underlying_type, arch),
-        Ok(pdb::TypeData::Bitfield(b)) => type_byte_size(finder, b.underlying_type, arch),
+        Ok(pdb::TypeData::Enumeration(e)) => {
+            type_byte_size(finder, e.underlying_type, arch, udt_sizes)
+        }
+        Ok(pdb::TypeData::Modifier(m)) => {
+            type_byte_size(finder, m.underlying_type, arch, udt_sizes)
+        }
+        Ok(pdb::TypeData::Bitfield(b)) => {
+            type_byte_size(finder, b.underlying_type, arch, udt_sizes)
+        }
         _ => 0,
     }
 }

@@ -105,9 +105,22 @@ impl PeGlobalSymbols {
             return Some((f.name.clone(), 0));
         }
         // Interior of a named data global (e.g. `async_globals+0x2ca8` into a
-        // struct/array). Bounded by the variable's PDB type size.
+        // struct/array). Bounded by the variable's PDB type size when known;
+        // otherwise (public-only symbols, forward-ref template types) by the
+        // next variable start, capped at the section end.
         if let Some((start, v)) = self.variables.range(..=va).next_back() {
-            if v.size > 0 && va < *start + v.size as u64 {
+            let end = if v.size > 0 {
+                *start + v.size as u64
+            } else {
+                let next = self
+                    .variables
+                    .range((*start + 1)..)
+                    .next()
+                    .map(|(n, _)| *n)
+                    .unwrap_or(u64::MAX);
+                next.min(self.section_end(*start).unwrap_or(u64::MAX))
+            };
+            if va < end {
                 return Some((v.name.clone(), (va - *start) as i64));
             }
         }
@@ -186,6 +199,21 @@ impl PeGlobalSymbols {
 
     pub fn in_text(&self, va: u64) -> bool {
         self.text_range.as_ref().is_some_and(|r| r.contains(&va))
+    }
+
+    /// End VA of the data section containing `va` (caps gap-based interior
+    /// sizing so an unsized global can't spill across a section boundary).
+    fn section_end(&self, va: u64) -> Option<u64> {
+        [
+            &self.rdata_range,
+            &self.data_range,
+            &self.bss_range,
+            &self.idata_range,
+        ]
+        .into_iter()
+        .flatten()
+        .find(|r| r.contains(&va))
+        .map(|r| r.end)
     }
 }
 
