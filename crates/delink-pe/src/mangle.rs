@@ -146,6 +146,7 @@ mod tests {
         // MSVC-compiled objects, spanning the single-digit and multi-nibble
         // length forms and the space/`?5` escape.
         let cases: &[(&[u8], &str)] = &[
+            (b"", "??_C@_00CNPNBAHC@?$AA@"),
             (b"system", "??_C@_06FHFOAHML@system?$AA@"),
             (b"generic", "??_C@_07DCLBNMLN@generic?$AA@"),
             (b"iostream", "??_C@_08LLGCOLLL@iostream?$AA@"),

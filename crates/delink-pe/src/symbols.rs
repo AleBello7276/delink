@@ -126,23 +126,10 @@ impl PeGlobalSymbols {
         if let Some(f) = self.functions.get(&va) {
             return Some((f.name.clone(), 0));
         }
-        // Interior of a named data global (e.g. `async_globals+0x2ca8` into a
-        // struct/array). Bounded by the variable's PDB type size when known;
-        // otherwise (public-only symbols, forward-ref template types) by the
-        // next variable start, capped at the section end.
+        // Interior of a sized data global (e.g. `async_globals+0x2ca8` into a
+        // struct/array), bounded by the variable's PDB type size.
         if let Some((start, v)) = self.variables.range(..=va).next_back() {
-            let end = if v.size > 0 {
-                *start + v.size as u64
-            } else {
-                let next = self
-                    .variables
-                    .range((*start + 1)..)
-                    .next()
-                    .map(|(n, _)| *n)
-                    .unwrap_or(u64::MAX);
-                next.min(self.section_end(*start).unwrap_or(u64::MAX))
-            };
-            if va < end {
+            if v.size > 0 && va < *start + v.size as u64 {
                 return Some((v.name.clone(), (va - *start) as i64));
             }
         }
@@ -159,6 +146,23 @@ impl PeGlobalSymbols {
         // recompiled object) produces for those bytes.
         if let Some(name) = self.synthesize_string_symbol(va) {
             return Some((name, 0));
+        }
+        // Interior of an unsized data global (public-only symbol, forward-ref
+        // template type): extend to the next variable, capped at the section
+        // end. After string synthesis so a section-marker global at the base
+        // (e.g. `k_read_only_data_start`) can't swallow real string literals.
+        if let Some((start, v)) = self.variables.range(..=va).next_back() {
+            if v.size == 0 {
+                let next = self
+                    .variables
+                    .range((*start + 1)..)
+                    .next()
+                    .map(|(n, _)| *n)
+                    .unwrap_or(u64::MAX);
+                if va < next.min(self.section_end(*start).unwrap_or(u64::MAX)) {
+                    return Some((v.name.clone(), (va - *start) as i64));
+                }
+            }
         }
         // Section-relative fallback for anonymous data.
         self.section_relative(va)
@@ -196,10 +200,8 @@ impl PeGlobalSymbols {
             }
         }
         let end = end?;
-        if end == 0 {
-            // Empty string: ambiguous, leave to the section-relative fallback.
-            return None;
-        }
+        // Empty string (`end == 0`, a lone NUL) is still a real literal
+        // (`??_C@_00CNPNBAHC@?$AA@`); only reached for actually-referenced VAs.
         Some(crate::mangle::narrow_string_symbol(&rest[..end]))
     }
 
