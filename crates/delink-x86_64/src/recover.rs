@@ -77,6 +77,9 @@ pub struct RecoveryOutput {
     pub relocs: Vec<RecoveredReloc>,
     pub jump_tables: Vec<RecoveredJumpTable>,
     pub diag: RecoveryDiagnostics,
+    /// Byte offsets (within the function) of the `F3` prefix of each `rep ret`
+    /// (`F3 C3`) instruction. The emitter can strip these to plain `ret`.
+    pub rep_ret_offsets: Vec<u64>,
 }
 
 /// Trait that callers implement to resolve VAs to symbol names.
@@ -136,6 +139,7 @@ pub fn recover<R: SymbolResolver>(
         relocs: Vec::new(),
         jump_tables: Vec::new(),
         diag: RecoveryDiagnostics::default(),
+        rep_ret_offsets: Vec::new(),
     };
 
     let image_base = resolver.image_base();
@@ -162,6 +166,15 @@ pub fn recover<R: SymbolResolver>(
         let insn_offset = pc - fn_va;
         let insn_len = insn.len() as u64;
         let offsets = decoder.get_constant_offsets(&insn);
+
+        // `rep ret` (F3 C3): a 2-byte near return carrying a redundant REP
+        // prefix. Record the `F3` byte so the emitter can drop it to plain `ret`.
+        if insn.mnemonic() == Mnemonic::Ret
+            && insn_len == 2
+            && fn_bytes.get(insn_offset as usize) == Some(&0xF3)
+        {
+            out.rep_ret_offsets.push(insn_offset);
+        }
 
         // Invalidate any tracked __ImageBase register this instruction writes.
         // (Done before re-establishing state below so a fresh `lea` survives.)

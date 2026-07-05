@@ -12,7 +12,7 @@
 //! Intra-function branches are skipped. Unresolved targets are counted.
 
 use anyhow::Result;
-use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic};
 use tracing::trace;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +47,9 @@ pub struct RecoveryDiagnostics {
 pub struct RecoveryOutput {
     pub relocs: Vec<RecoveredReloc>,
     pub diag: RecoveryDiagnostics,
+    /// Byte offsets (within the function) of the `F3` prefix of each `rep ret`
+    /// (`F3 C3`) instruction. The emitter can strip these to plain `ret`.
+    pub rep_ret_offsets: Vec<u64>,
 }
 
 /// Trait that callers implement to resolve VAs to symbol names.
@@ -76,6 +79,7 @@ pub fn recover<R: SymbolResolver>(
     let mut out = RecoveryOutput {
         relocs: Vec::new(),
         diag: RecoveryDiagnostics::default(),
+        rep_ret_offsets: Vec::new(),
     };
 
     while decoder.can_decode() {
@@ -90,6 +94,15 @@ pub fn recover<R: SymbolResolver>(
         let pc = insn.ip();
         let insn_offset = pc - (fn_va & 0xFFFF_FFFF);
         let insn_len = insn.len() as u64;
+
+        // `rep ret` (F3 C3): a 2-byte near return carrying a redundant REP
+        // prefix. Record the `F3` byte so the emitter can drop it to plain `ret`.
+        if insn.mnemonic() == Mnemonic::Ret
+            && insn_len == 2
+            && fn_bytes.get(insn_offset as usize) == Some(&0xF3)
+        {
+            out.rep_ret_offsets.push(insn_offset);
+        }
 
         // Only direct near branches (call rel32 / jmp rel32 / jcc rel32).
         // rel8 branches are 2 bytes; rel32 are 5 (E8/E9) or 6 (0F 8x) bytes.

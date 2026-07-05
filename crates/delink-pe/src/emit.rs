@@ -37,6 +37,36 @@ const REL_I386_REL32: u16 = object::pe::IMAGE_REL_I386_REL32;
 // We subtract the same amount here so the final embedded value equals r.addend.
 const REL32_FIELD_BYTES: i64 = 4;
 
+/// Remove the redundant `F3` (REP) prefix of each `rep ret`, turning `F3 C3`
+/// into a plain `ret` (`C3`). `f3_offsets` holds the byte offset of each `F3`
+/// byte to drop (as reported by the recovery pass).
+fn strip_rep_ret_prefixes(bytes: &[u8], f3_offsets: &[u64]) -> Vec<u8> {
+    if f3_offsets.is_empty() {
+        return bytes.to_vec();
+    }
+    let mut drop: Vec<usize> = f3_offsets.iter().map(|&o| o as usize).collect();
+    drop.sort_unstable();
+    let mut out = Vec::with_capacity(bytes.len().saturating_sub(drop.len()));
+    let mut di = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        if di < drop.len() && drop[di] == i {
+            di += 1;
+            continue;
+        }
+        out.push(b);
+    }
+    out
+}
+
+/// Translate an offset in the original function bytes to its position after the
+/// `f3_offsets` prefix bytes have been removed by [`strip_rep_ret_prefixes`]:
+/// every removed byte strictly before `off` shifts it down by one. No fixup
+/// field, label, or table ever sits on an `F3` prefix, so those offsets remap
+/// cleanly.
+fn remap_after_strip(off: u64, f3_offsets: &[u64]) -> u64 {
+    off - f3_offsets.iter().filter(|&&p| p < off).count() as u64
+}
+
 #[derive(Debug, Default)]
 pub struct EmitStats {
     pub text_bytes: u64,
@@ -68,7 +98,16 @@ pub struct CuOutcome {
 // ---------------------------------------------------------------------------
 
 /// Emit one COFF `.obj` for `cu`, writing to `out_path`.
-pub fn emit_pe_cu(pe: &PeContext, cu: &PeCompilationUnit, out_path: &Path) -> Result<EmitStats> {
+///
+/// When `replace_rep_ret` is set, each `rep ret` (`F3 C3`) in a function body is
+/// rewritten to a plain `ret` (`C3`) by dropping the redundant `F3` prefix, and
+/// all relocation / label / jump-table offsets past it are shifted accordingly.
+pub fn emit_pe_cu(
+    pe: &PeContext,
+    cu: &PeCompilationUnit,
+    out_path: &Path,
+    replace_rep_ret: bool,
+) -> Result<EmitStats> {
     let text_section = pe
         .sections
         .iter()
@@ -136,6 +175,24 @@ pub fn emit_pe_cu(pe: &PeContext, cu: &PeCompilationUnit, out_path: &Path) -> Re
                 total_unresolved_calls += recovery.diag.calls_unresolved;
                 total_unresolved_rip += recovery.diag.rip_refs_unresolved;
 
+                // `rep ret` prefixes to strip (skip any that fall inside a
+                // recovered jump table, where a stray `F3 C3` is data, not code).
+                let f3: Vec<u64> = if replace_rep_ret {
+                    recovery
+                        .rep_ret_offsets
+                        .iter()
+                        .copied()
+                        .filter(|&o| {
+                            !recovery
+                                .jump_tables
+                                .iter()
+                                .any(|jt| o >= jt.offset && o < jt.offset + jt.entry_count * 4)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
                 // Zero REL32 positions.
                 for r in &recovery.relocs {
                     let off = r.offset as usize;
@@ -172,7 +229,8 @@ pub fn emit_pe_cu(pe: &PeContext, cu: &PeCompilationUnit, out_path: &Path) -> Re
                     }
                 }
 
-                let fn_offset = obj.append_section_data(sid, &fn_bytes, 1);
+                let out_bytes = strip_rep_ret_prefixes(&fn_bytes, &f3);
+                let fn_offset = obj.append_section_data(sid, &out_bytes, 1);
 
                 let scope = if f.is_public {
                     SymbolScope::Dynamic
@@ -182,7 +240,7 @@ pub fn emit_pe_cu(pe: &PeContext, cu: &PeCompilationUnit, out_path: &Path) -> Re
                 let sym_id = obj.add_symbol(Symbol {
                     name: sanitize_symbol_name(&f.name),
                     value: fn_offset,
-                    size: f.size as u64,
+                    size: out_bytes.len() as u64,
                     kind: SymbolKind::Text,
                     scope,
                     weak: false,
@@ -203,7 +261,7 @@ pub fn emit_pe_cu(pe: &PeContext, cu: &PeCompilationUnit, out_path: &Path) -> Re
                     };
                     let label_id = obj.add_symbol(Symbol {
                         name: sanitize_symbol_name(&var.name),
-                        value: fn_offset + (var_va - f.va),
+                        value: fn_offset + remap_after_strip(var_va - f.va, &f3),
                         size: 0,
                         kind: SymbolKind::Label,
                         scope: label_scope,
@@ -218,7 +276,7 @@ pub fn emit_pe_cu(pe: &PeContext, cu: &PeCompilationUnit, out_path: &Path) -> Re
                     obj.add_relocation(
                         sid,
                         Relocation {
-                            offset: fn_offset + off,
+                            offset: fn_offset + remap_after_strip(off, &f3),
                             symbol: sym,
                             addend,
                             flags: RelocationFlags::Coff { typ },
@@ -234,7 +292,7 @@ pub fn emit_pe_cu(pe: &PeContext, cu: &PeCompilationUnit, out_path: &Path) -> Re
                 for jt in &recovery.jump_tables {
                     let jt_id = obj.add_symbol(Symbol {
                         name: sanitize_symbol_name(&jt.name),
-                        value: fn_offset + jt.offset,
+                        value: fn_offset + remap_after_strip(jt.offset, &f3),
                         size: jt.entry_count * 4,
                         kind: SymbolKind::Data,
                         scope: SymbolScope::Compilation,
@@ -264,7 +322,7 @@ pub fn emit_pe_cu(pe: &PeContext, cu: &PeCompilationUnit, out_path: &Path) -> Re
                     obj.add_relocation(
                         sid,
                         Relocation {
-                            offset: fn_offset + r.offset,
+                            offset: fn_offset + remap_after_strip(r.offset, &f3),
                             symbol: sym_id,
                             addend,
                             flags: RelocationFlags::Coff { typ },
@@ -282,6 +340,13 @@ pub fn emit_pe_cu(pe: &PeContext, cu: &PeCompilationUnit, out_path: &Path) -> Re
                 total_instructions += recovery.diag.instructions;
                 total_unresolved_calls += recovery.diag.calls_unresolved;
                 total_unresolved_rip += recovery.diag.rip_refs_unresolved;
+
+                // `rep ret` prefixes to strip from this function body.
+                let f3: Vec<u64> = if replace_rep_ret {
+                    recovery.rep_ret_offsets.clone()
+                } else {
+                    Vec::new()
+                };
 
                 // Zero REL32 positions.
                 for r in &recovery.relocs {
@@ -313,7 +378,8 @@ pub fn emit_pe_cu(pe: &PeContext, cu: &PeCompilationUnit, out_path: &Path) -> Re
                     }
                 }
 
-                let fn_offset = obj.append_section_data(sid, &fn_bytes, 1);
+                let out_bytes = strip_rep_ret_prefixes(&fn_bytes, &f3);
+                let fn_offset = obj.append_section_data(sid, &out_bytes, 1);
 
                 let scope = if f.is_public {
                     SymbolScope::Dynamic
@@ -323,7 +389,7 @@ pub fn emit_pe_cu(pe: &PeContext, cu: &PeCompilationUnit, out_path: &Path) -> Re
                 let sym_id = obj.add_symbol(Symbol {
                     name: sanitize_symbol_name(&f.name),
                     value: fn_offset,
-                    size: f.size as u64,
+                    size: out_bytes.len() as u64,
                     kind: SymbolKind::Text,
                     scope,
                     weak: false,
@@ -344,7 +410,7 @@ pub fn emit_pe_cu(pe: &PeContext, cu: &PeCompilationUnit, out_path: &Path) -> Re
                     };
                     let label_id = obj.add_symbol(Symbol {
                         name: sanitize_symbol_name(&var.name),
-                        value: fn_offset + (var_va - f.va),
+                        value: fn_offset + remap_after_strip(var_va - f.va, &f3),
                         size: 0,
                         kind: SymbolKind::Label,
                         scope: label_scope,
@@ -359,7 +425,7 @@ pub fn emit_pe_cu(pe: &PeContext, cu: &PeCompilationUnit, out_path: &Path) -> Re
                     obj.add_relocation(
                         sid,
                         Relocation {
-                            offset: fn_offset + off,
+                            offset: fn_offset + remap_after_strip(off, &f3),
                             symbol: sym,
                             addend,
                             flags: RelocationFlags::Coff { typ },
@@ -374,7 +440,7 @@ pub fn emit_pe_cu(pe: &PeContext, cu: &PeCompilationUnit, out_path: &Path) -> Re
                     obj.add_relocation(
                         sid,
                         Relocation {
-                            offset: fn_offset + r.offset,
+                            offset: fn_offset + remap_after_strip(r.offset, &f3),
                             symbol: sym_id,
                             addend: r.addend - REL32_FIELD_BYTES,
                             flags: RelocationFlags::Coff {
@@ -714,7 +780,11 @@ pub fn emit_pe_shared(pe: &PeContext, out_path: &Path) -> Result<SharedDataStats
 // Parallel split
 // ---------------------------------------------------------------------------
 
-pub fn split_all_pe(pe: &PeContext, out_dir: &Path) -> Result<Vec<CuOutcome>> {
+pub fn split_all_pe(
+    pe: &PeContext,
+    out_dir: &Path,
+    replace_rep_ret: bool,
+) -> Result<Vec<CuOutcome>> {
     std::fs::create_dir_all(out_dir).with_context(|| format!("create {}", out_dir.display()))?;
 
     // Emit the mangled names of all PDB-declared inline functions.
@@ -734,7 +804,7 @@ pub fn split_all_pe(pe: &PeContext, out_dir: &Path) -> Result<Vec<CuOutcome>> {
         .map(|cu| {
             let stem = sanitize_file_stem(&cu.name);
             let file = out_dir.join(format!("{:04}_{stem}.obj", cu.id));
-            let result = emit_pe_cu(pe, cu, &file).map_err(|e| format!("{e:#}"));
+            let result = emit_pe_cu(pe, cu, &file, replace_rep_ret).map_err(|e| format!("{e:#}"));
             CuOutcome {
                 cu_name: cu.name.clone(),
                 file,

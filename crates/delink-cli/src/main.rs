@@ -102,6 +102,9 @@ enum Cmd {
         /// Output directory for the `.obj` files.
         #[arg(short, long)]
         outdir: PathBuf,
+        /// Rewrite `rep ret` (F3 C3) to a plain `ret` (C3) in emitted code.
+        #[arg(long)]
+        replace_rep_ret: bool,
     },
 
     // -----------------------------------------------------------------------
@@ -229,7 +232,12 @@ fn main() -> Result<()> {
             contains,
             limit,
         } => cmd_pe_list_cus(&input, &pdb, &contains, limit),
-        Cmd::PeSplit { input, pdb, outdir } => cmd_pe_split(&input, &pdb, &outdir),
+        Cmd::PeSplit {
+            input,
+            pdb,
+            outdir,
+            replace_rep_ret,
+        } => cmd_pe_split(&input, &pdb, &outdir, replace_rep_ret),
         Cmd::MachoInspect { input } => cmd_macho_inspect(&input),
         Cmd::MachoListCus {
             input,
@@ -978,7 +986,12 @@ fn cmd_macho_split(
     Ok(())
 }
 
-fn cmd_pe_split(exe_path: &Path, pdb_path: &Path, outdir: &Path) -> Result<()> {
+fn cmd_pe_split(
+    exe_path: &Path,
+    pdb_path: &Path,
+    outdir: &Path,
+    replace_rep_ret: bool,
+) -> Result<()> {
     let pe = load_pe_context(exe_path, pdb_path)?;
 
     tracing::info!(
@@ -990,7 +1003,7 @@ fn cmd_pe_split(exe_path: &Path, pdb_path: &Path, outdir: &Path) -> Result<()> {
             .count()
     );
 
-    let outcomes = delink_pe::emit::split_all_pe(&pe, outdir)?;
+    let outcomes = delink_pe::emit::split_all_pe(&pe, outdir, replace_rep_ret)?;
 
     let shared = outdir.join("__shared_data.obj");
     tracing::info!("emitting shared data → {}", shared.display());
