@@ -49,6 +49,9 @@ pub struct PeVariable {
     pub va: u64,
     /// True for `S_GDATA32` (global) vs `S_LDATA32` (file-static).
     pub is_public: bool,
+    /// Byte size from the PDB type, or 0 if unknown. Used to resolve interior
+    /// references (e.g. `async_globals+0x2ca8` into a struct global).
+    pub size: u32,
 }
 
 /// A byte range of a PE section that belongs to one PDB module.
@@ -129,25 +132,27 @@ pub fn build_cu_index(
     // convention may not appear in the public symbols stream with their decorated
     // name (_funcname@N).  Pre-compute a map from procedure TypeIndex to the
     // total bytes of parameters so we can reconstruct the mangled name later.
-    let stdcall_param_bytes: HashMap<pdb::TypeIndex, u32> = {
-        let mut map = HashMap::new();
-        if matches!(arch, PeArch::X86) {
-            if let Ok(type_information) = pdb.type_information() {
-                let mut type_finder = type_information.finder();
-                let mut iter = type_information.iter();
-                while let Ok(Some(typ)) = iter.next() {
-                    type_finder.update(&iter);
-                    if let Ok(pdb::TypeData::Procedure(proc)) = typ.parse() {
-                        if proc.attributes.calling_convention() == CV_CALL_NEAR_STD {
-                            let bytes = x86_proc_param_bytes(&type_finder, proc.argument_list);
-                            map.insert(typ.index(), bytes);
-                        }
+    // Build a fully-populated type finder (used to size data globals so interior
+    // references resolve, and on x86 to reconstruct __stdcall param bytes).
+    let type_information = pdb.type_information().ok();
+    let mut type_finder = type_information.as_ref().map(|ti| ti.finder());
+    let mut stdcall_param_bytes: HashMap<pdb::TypeIndex, u32> = HashMap::new();
+    if let (Some(ti), Some(finder)) = (type_information.as_ref(), type_finder.as_mut()) {
+        let mut iter = ti.iter();
+        while let Ok(Some(typ)) = iter.next() {
+            finder.update(&iter);
+            if matches!(arch, PeArch::X86) {
+                if let Ok(pdb::TypeData::Procedure(proc)) = typ.parse() {
+                    if proc.attributes.calling_convention() == CV_CALL_NEAR_STD {
+                        let bytes = x86_proc_param_bytes(finder, proc.argument_list);
+                        stdcall_param_bytes.insert(typ.index(), bytes);
                     }
                 }
             }
         }
-        map
-    };
+    }
+    // Immutable view for the data-sizing lookups below.
+    let type_finder = type_finder;
 
     let dbi = pdb.debug_information().context("PDB debug information")?;
     let address_map = pdb.address_map().context("PDB address map")?;
@@ -299,10 +304,15 @@ pub fn build_cu_index(
                         let name = mangled_by_va.get(&va).cloned().unwrap_or_else(|| {
                             x86_c_data_name(d.name.to_string().into_owned(), arch)
                         });
+                        let size = type_finder
+                            .as_ref()
+                            .map(|f| type_byte_size(f, d.type_index, arch))
+                            .unwrap_or(0);
                         let v = PeVariable {
                             name,
                             va,
                             is_public: d.global,
+                            size,
                         };
                         all_variables.entry(va).or_insert_with(|| v);
                     }
@@ -328,6 +338,7 @@ pub fn build_cu_index(
                             name,
                             va,
                             is_public: false,
+                            size: 0,
                         });
                     }
                     _ => {}
@@ -377,6 +388,7 @@ pub fn build_cu_index(
             name,
             va,
             is_public: true,
+            size: 0,
         });
     }
 
@@ -395,6 +407,51 @@ fn section_name_for_va(sections: &[PeSection], va: u64) -> String {
         .find(|s| s.contains_va(va))
         .map(|s| s.name.clone())
         .unwrap_or_else(|| "?".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Data type sizing
+// ---------------------------------------------------------------------------
+
+/// Byte size of a PDB type, for bounding interior references into data globals.
+/// Returns 0 when unknown (interior resolution is then skipped).
+fn type_byte_size(finder: &pdb::TypeFinder<'_>, idx: pdb::TypeIndex, arch: PeArch) -> u32 {
+    let ptr = if matches!(arch, PeArch::X86) { 4 } else { 8 };
+    let Ok(t) = finder.find(idx) else {
+        return 0;
+    };
+    match t.parse() {
+        Ok(pdb::TypeData::Class(c)) => c.size as u32,
+        Ok(pdb::TypeData::Union(u)) => u.size as u32,
+        // Dimensions are cumulative byte sizes; the last is the whole array.
+        Ok(pdb::TypeData::Array(a)) => a.dimensions.last().copied().unwrap_or(0),
+        Ok(pdb::TypeData::Pointer(_)) => ptr,
+        Ok(pdb::TypeData::Primitive(p)) => {
+            if p.indirection.is_some() {
+                ptr
+            } else {
+                primitive_byte_size(p.kind)
+            }
+        }
+        Ok(pdb::TypeData::Enumeration(e)) => type_byte_size(finder, e.underlying_type, arch),
+        Ok(pdb::TypeData::Modifier(m)) => type_byte_size(finder, m.underlying_type, arch),
+        Ok(pdb::TypeData::Bitfield(b)) => type_byte_size(finder, b.underlying_type, arch),
+        _ => 0,
+    }
+}
+
+/// True byte size of a primitive type (unlike the stack-slot size below).
+fn primitive_byte_size(kind: pdb::PrimitiveKind) -> u32 {
+    use pdb::PrimitiveKind::*;
+    match kind {
+        I8 | U8 | Char | UChar | RChar | Bool8 => 1,
+        I16 | U16 | Short | UShort | WChar | RChar16 | Bool16 | F16 => 2,
+        I32 | U32 | Long | ULong | RChar32 | F32 | F32PP | Bool32 | HRESULT => 4,
+        I64 | U64 | Quad | UQuad | F64 | Bool64 => 8,
+        F80 => 10,
+        I128 | U128 | Octa | UOcta | F128 => 16,
+        _ => 0,
+    }
 }
 
 // ---------------------------------------------------------------------------

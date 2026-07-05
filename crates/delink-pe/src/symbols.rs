@@ -104,6 +104,13 @@ impl PeGlobalSymbols {
         if let Some(f) = self.functions.get(&va) {
             return Some((f.name.clone(), 0));
         }
+        // Interior of a named data global (e.g. `async_globals+0x2ca8` into a
+        // struct/array). Bounded by the variable's PDB type size.
+        if let Some((start, v)) = self.variables.range(..=va).next_back() {
+            if v.size > 0 && va < *start + v.size as u64 {
+                return Some((v.name.clone(), (va - *start) as i64));
+            }
+        }
         // Interior of a function (e.g. reference into a jump table or literal pool
         // that lives inside a function's address range in the PDB).
         if let Some((start, f)) = self.functions.range(..=va).next_back() {
