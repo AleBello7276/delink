@@ -248,6 +248,14 @@ pub fn emit_pe_cu(
                     flags: SymbolFlags::None,
                 });
                 local_syms.insert(f.name.clone(), sym_id);
+                emit_alias_symbols(
+                    &mut obj,
+                    &mut local_syms,
+                    f,
+                    sid,
+                    fn_offset,
+                    out_bytes.len() as u64,
+                );
 
                 // Emit symbols for data labels embedded within this function's body.
                 for (var_va, var) in pe.symbols.variables.range(f.va..f.va + f.size as u64) {
@@ -397,6 +405,14 @@ pub fn emit_pe_cu(
                     flags: SymbolFlags::None,
                 });
                 local_syms.insert(f.name.clone(), sym_id);
+                emit_alias_symbols(
+                    &mut obj,
+                    &mut local_syms,
+                    f,
+                    sid,
+                    fn_offset,
+                    out_bytes.len() as u64,
+                );
 
                 // Emit symbols for data labels embedded within this function's body.
                 for (var_va, var) in pe.symbols.variables.range(f.va..f.va + f.size as u64) {
@@ -830,6 +846,36 @@ fn resolve_symbol(
         return *id;
     }
     resolve_or_add_undef(obj, undef, name)
+}
+
+/// Emit each folded-public alias of `f` (extra S_PUB32 names at the same VA,
+/// e.g. `??_E`/`??_G` deleting destructors ICF-folded by the original linker)
+/// as an additional defined symbol at the function's offset, so every name the
+/// original link knew is defined for relinking.
+fn emit_alias_symbols(
+    obj: &mut Object,
+    local_syms: &mut HashMap<String, SymbolId>,
+    f: &PeFunction,
+    sid: SectionId,
+    fn_offset: u64,
+    size: u64,
+) {
+    for alias in &f.aliases {
+        if *alias == f.name || local_syms.contains_key(alias) {
+            continue;
+        }
+        let id = obj.add_symbol(Symbol {
+            name: sanitize_symbol_name(alias),
+            value: fn_offset,
+            size,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Dynamic,
+            weak: false,
+            section: SymbolSection::Section(sid),
+            flags: SymbolFlags::None,
+        });
+        local_syms.insert(alias.clone(), id);
+    }
 }
 
 fn resolve_or_add_undef(

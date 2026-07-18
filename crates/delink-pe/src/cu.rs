@@ -40,6 +40,10 @@ pub struct PeFunction {
     /// True for `S_GPROC32` (global) vs `S_LPROC32` (local).
     pub is_public: bool,
     pub module_id: usize,
+    /// Additional public (S_PUB32) names at the same VA (e.g. the linker folded
+    /// `??_E`/`??_G` deleting destructors into one body). Emitted as extra
+    /// defined symbols at the same section offset so both names link.
+    pub aliases: Vec<String>,
 }
 
 /// A global or static data variable extracted from the PDB.
@@ -179,6 +183,10 @@ pub fn build_cu_index(
     // Data-typed public symbols (not code, not function) are also collected
     // separately so they can fill gaps where no S_GDATA32/S_LDATA32 exists.
     let mut mangled_by_va: HashMap<u64, String> = HashMap::new();
+    // Extra public names sharing a VA with the primary (identical-COMDAT-folded
+    // functions, e.g. `??_E`/`??_G` deleting destructors). Last public in the
+    // stream becomes primary; earlier ones become alias symbols on the function.
+    let mut public_aliases_by_va: HashMap<u64, Vec<String>> = HashMap::new();
     let mut public_data_by_va: HashMap<u64, String> = HashMap::new();
     // Public code symbols with no per-module procedure record (statically-linked
     // CRT helpers like `memcpy`), so call targets into them still resolve.
@@ -205,7 +213,20 @@ pub fn build_cu_index(
                         .or_insert_with(|| name.clone());
                     if let Some(rva) = p.offset.to_rva(&address_map) {
                         let va = image_base + rva.0 as u64;
-                        mangled_by_va.insert(va, name.clone());
+                        match mangled_by_va.get_mut(&va) {
+                            Some(primary) if *primary != name => {
+                                let old = std::mem::replace(primary, name.clone());
+                                let aliases = public_aliases_by_va.entry(va).or_default();
+                                aliases.retain(|a| *a != name);
+                                if !aliases.contains(&old) {
+                                    aliases.push(old);
+                                }
+                            }
+                            Some(_) => {}
+                            None => {
+                                mangled_by_va.insert(va, name.clone());
+                            }
+                        }
                         if p.function || p.code {
                             public_code_by_va.insert(va, name);
                         } else {
@@ -310,6 +331,7 @@ pub fn build_cu_index(
                             size: p.len,
                             is_public: p.global,
                             module_id: cu_id,
+                            aliases: public_aliases_by_va.get(&va).cloned().unwrap_or_default(),
                         };
                         all_functions.entry(va).or_insert_with(|| f.clone());
                         functions.push(f);
