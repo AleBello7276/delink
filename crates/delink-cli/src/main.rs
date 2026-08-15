@@ -1083,29 +1083,16 @@ fn apply_symbol_overrides(
         );
     }
     for (address, (name, section, size, symbol_type)) in overrides {
-        let emitted_name = if symbol_type == "imp" && !name.starts_with("__imp_") {
-            format!("__imp_{}", decorate_override_name(&name))
+        let emitted_name = if symbol_type == "imp" {
+            name.clone()
         } else {
             decorate_override_name(&name)
         };
         if let Some(import) = pe.imports.get_mut(&address) {
-            *import = format!("__imp_{emitted_name}");
+            *import = emitted_name.clone();
         }
         if let Some(import) = pe.symbols.imports.get_mut(&address) {
-            *import = format!("__imp_{emitted_name}");
-        }
-        if symbol_type == "import" {
-            let undecorated = format!("__imp_{}", name);
-            for import in pe.imports.values_mut() {
-                if *import == undecorated || import.ends_with(&name) {
-                    *import = format!("__imp_{emitted_name}");
-                }
-            }
-            for import in pe.symbols.imports.values_mut() {
-                if *import == undecorated || import.ends_with(&name) {
-                    *import = format!("__imp_{emitted_name}");
-                }
-            }
+            *import = emitted_name.clone();
         }
         if let Some(function) = pe.symbols.functions.get_mut(&address) {
             function.name = emitted_name.clone();

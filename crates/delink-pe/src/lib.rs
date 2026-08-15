@@ -98,7 +98,7 @@ pub struct PeContext {
     pub symbols: PeGlobalSymbols,
     /// Base relocations from `.reloc` — one entry per embedded absolute pointer.
     pub base_relocations: Vec<BaseReloc>,
-    /// IAT slot VA → `"__imp_funcname"` symbol name.
+    /// IAT slot VA to the import symbol name, normally `__imp_funcname`.
     pub imports: HashMap<u64, String>,
     /// Mangled names of procedures the PDB marks as declared inline
     /// (`S_FRAMEPROC` `fInlSpec`), sorted and de-duplicated.
