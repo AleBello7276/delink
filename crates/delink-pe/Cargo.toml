@@ -6,10 +6,12 @@ license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 object = { workspace = true }
 pdb = { workspace = true }
 rayon = { workspace = true }
+iced-x86 = { workspace = true }
 delink-x86_64 = { workspace = true }
 delink-x86 = { workspace = true }

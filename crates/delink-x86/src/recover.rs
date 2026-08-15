@@ -12,13 +12,15 @@
 //! Intra-function branches are skipped. Unresolved targets are counted.
 
 use anyhow::Result;
-use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use tracing::trace;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelocKind {
     /// IMAGE_REL_I386_REL32 — 32-bit PC-relative (calls, jumps).
     Rel32,
+    /// IMAGE_REL_I386_DIR32 — absolute address, including an IAT slot.
+    Dir32,
 }
 
 #[derive(Debug, Clone)]
@@ -104,13 +106,80 @@ pub fn recover<R: SymbolResolver>(
             out.rep_ret_offsets.push(insn_offset);
         }
 
+        // PUSH imm32 is commonly used for string/data arguments in x86 code.
+        // Recover its absolute address even when the PE has no base relocations.
+        if fn_bytes.get(insn_offset as usize) == Some(&0x68) && insn.len() == 5 {
+            let target_va = u32::from_le_bytes(
+                fn_bytes[insn_offset as usize + 1..insn_offset as usize + 5]
+                    .try_into()
+                    .unwrap(),
+            ) as u64;
+            if let Some((sym, addend)) = resolver.resolve_data(target_va) {
+                out.relocs.push(RecoveredReloc {
+                    offset: insn_offset + 1,
+                    pc,
+                    kind: RelocKind::Dir32,
+                    target: sym,
+                    addend,
+                });
+            }
+        }
+
+        // MOV moffs32 forms (A1/A3) encode an absolute address without an
+        // iced-x86 memory displacement field.
+        if matches!(fn_bytes.get(insn_offset as usize), Some(0xA1 | 0xA3)) && insn.len() == 5 {
+            let target_va = u32::from_le_bytes(
+                fn_bytes[insn_offset as usize + 1..insn_offset as usize + 5]
+                    .try_into()
+                    .unwrap(),
+            ) as u64;
+            if let Some((sym, addend)) = resolver.resolve_data(target_va) {
+                out.relocs.push(RecoveredReloc {
+                    offset: insn_offset + 1,
+                    pc,
+                    kind: RelocKind::Dir32,
+                    target: sym,
+                    addend,
+                });
+            }
+        }
+
+        // Recover absolute memory operands such as `cmp dword ptr [global], 0`.
+        // These references are not necessarily present in the PE base-reloc table.
+        if insn.op0_kind() == OpKind::Memory
+            && insn.memory_base() == Register::None
+            && insn.memory_index() == Register::None
+            && insn.memory_displ_size() == 4
+            && !matches!(
+                insn.flow_control(),
+                FlowControl::IndirectCall | FlowControl::IndirectBranch
+            )
+        {
+            let target_va = insn.memory_displacement64();
+            if let Some((sym, addend)) = resolver.resolve_data(target_va) {
+                let bytes = &fn_bytes[insn_offset as usize..(insn_offset + insn_len) as usize];
+                if let Some(relative) = bytes
+                    .windows(4)
+                    .position(|window| window == &(target_va as u32).to_le_bytes())
+                {
+                    out.relocs.push(RecoveredReloc {
+                        offset: insn_offset + relative as u64,
+                        pc,
+                        kind: RelocKind::Dir32,
+                        target: sym,
+                        addend,
+                    });
+                }
+            }
+        }
+
         // Only direct near branches (call rel32 / jmp rel32 / jcc rel32).
         // rel8 branches are 2 bytes; rel32 are 5 (E8/E9) or 6 (0F 8x) bytes.
         match insn.flow_control() {
             FlowControl::Call
             | FlowControl::UnconditionalBranch
             | FlowControl::ConditionalBranch
-                if insn_len >= 5 =>
+                if insn_len >= 5 && insn.op0_kind() != OpKind::Memory =>
             {
                 // near_branch32() gives the absolute 32-bit target VA.
                 let target_va = insn.near_branch32() as u64;
@@ -135,6 +204,25 @@ pub fn recover<R: SymbolResolver>(
                             out.diag.calls_unresolved += 1;
                         }
                     }
+                }
+            }
+            FlowControl::IndirectCall | FlowControl::IndirectBranch
+                if insn.op0_kind() == OpKind::Memory
+                    && insn.memory_base() == Register::None
+                    && insn.memory_index() == Register::None =>
+            {
+                let target_va = insn.memory_displacement64();
+                if let Some((sym, addend)) = resolver.resolve_data(target_va) {
+                    out.relocs.push(RecoveredReloc {
+                        offset: insn_offset + insn_len - 4,
+                        pc,
+                        kind: RelocKind::Dir32,
+                        target: sym,
+                        addend,
+                    });
+                    out.diag.calls_resolved += 1;
+                } else {
+                    out.diag.calls_unresolved += 1;
                 }
             }
             _ => {}

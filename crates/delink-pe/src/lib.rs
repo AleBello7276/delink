@@ -6,16 +6,18 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
+pub mod analysis;
 pub mod cu;
 pub mod emit;
 pub mod mangle;
 pub mod symbols;
 
+pub use analysis::{AnalysisOutput, AnalysisSpan, AnalysisSplit, AnalysisSymbol};
 pub use cu::{PeCompilationUnit, PeContrib, PeCuIndex, PeFunction, PeVariable};
 pub use symbols::PeGlobalSymbols;
 
 /// Target architecture of the loaded PE.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PeArch {
     /// AMD64 / x86-64 (machine = 0x8664, magic = 0x020B PE32+).
     X86_64,
@@ -24,7 +26,7 @@ pub enum PeArch {
 }
 
 /// A single PE section with its raw bytes and virtual-address metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PeSection {
     pub name: String,
     /// RVA (relative virtual address from image base).
@@ -71,13 +73,13 @@ impl PeSection {
 }
 
 /// A base-relocation entry from the `.reloc` section.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BaseReloc {
     pub va: u64,
     pub kind: BaseRelocKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BaseRelocKind {
     /// `IMAGE_REL_BASED_DIR64` (10) — 64-bit absolute pointer (PE32+).
     Dir64,
@@ -119,7 +121,7 @@ impl PeContext {
 ///
 /// Accepts both 32-bit (PE32, machine I386) and 64-bit (PE32+, machine AMD64).
 pub fn load_pe_and_pdb(exe_data: &[u8], pdb_data: &[u8]) -> Result<PeContext> {
-    let (arch, image_base, sections) = parse_pe_sections(exe_data)?;
+    let (arch, image_base, _entry_point_rva, sections, _exports) = parse_pe_sections(exe_data)?;
     let base_relocations = parse_base_relocations(&sections, image_base);
     let imports = parse_imports(exe_data, &sections, image_base, arch);
 
@@ -156,9 +158,14 @@ pub fn load_pe_and_pdb(exe_data: &[u8], pdb_data: &[u8]) -> Result<PeContext> {
 pub struct PeImage {
     pub arch: PeArch,
     pub image_base: u64,
+    /// Absolute entry-point VA from the PE optional header.
+    pub entry_point: u64,
+    pub exported_entrypoints: Vec<u64>,
     pub sections: Vec<PeSection>,
     /// Base relocations from `.reloc` (empty for images without the table).
     pub base_relocations: Vec<BaseReloc>,
+    /// IAT slot VA to imported COFF symbol name.
+    pub imports: HashMap<u64, String>,
 }
 
 impl PeImage {
@@ -174,13 +181,17 @@ impl PeImage {
 
 /// Parse a PE executable without a PDB: sections + image base + base relocations.
 pub fn load_pe_image(exe_data: &[u8]) -> Result<PeImage> {
-    let (arch, image_base, sections) = parse_pe_sections(exe_data)?;
+    let (arch, image_base, entry_point_rva, sections, exports) = parse_pe_sections(exe_data)?;
     let base_relocations = parse_base_relocations(&sections, image_base);
+    let imports = parse_imports(exe_data, &sections, image_base, arch);
     Ok(PeImage {
         arch,
         image_base,
+        entry_point: image_base + entry_point_rva,
+        exported_entrypoints: exports,
         sections,
         base_relocations,
+        imports,
     })
 }
 
@@ -188,7 +199,7 @@ pub fn load_pe_image(exe_data: &[u8]) -> Result<PeImage> {
 // PE header parsing
 // ---------------------------------------------------------------------------
 
-fn parse_pe_sections(exe_data: &[u8]) -> Result<(PeArch, u64, Vec<PeSection>)> {
+fn parse_pe_sections(exe_data: &[u8]) -> Result<(PeArch, u64, u64, Vec<PeSection>, Vec<u64>)> {
     if exe_data.len() < 0x40 {
         return Err(anyhow!("file too small for PE header"));
     }
@@ -255,6 +266,8 @@ fn parse_pe_sections(exe_data: &[u8]) -> Result<(PeArch, u64, Vec<PeSection>)> {
             ))
         }
     };
+    let entry_point_rva =
+        u32::from_le_bytes(exe_data[opt_off + 16..opt_off + 20].try_into().unwrap()) as u64;
 
     // Section headers start after the optional header.
     let sections_off = opt_off + opt_header_size;
@@ -303,7 +316,36 @@ fn parse_pe_sections(exe_data: &[u8]) -> Result<(PeArch, u64, Vec<PeSection>)> {
         });
     }
 
-    Ok((arch, image_base, sections))
+    let directory_base = opt_off + if magic == 0x020B { 112 } else { 96 };
+    let export_rva = if directory_base + 8 <= exe_data.len() {
+        u32::from_le_bytes(
+            exe_data[directory_base..directory_base + 4]
+                .try_into()
+                .unwrap(),
+        ) as u64
+    } else {
+        0
+    };
+    let exports = parse_export_entrypoints(export_rva, &sections);
+    Ok((arch, image_base, entry_point_rva, sections, exports))
+}
+
+fn parse_export_entrypoints(export_rva: u64, sections: &[PeSection]) -> Vec<u64> {
+    let read_u32 = |rva: u64| -> Option<u32> {
+        let section = sections.iter().find(|s| s.contains_rva(rva))?;
+        let bytes = section.data_at_rva(rva, 4)?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    };
+    if export_rva == 0 {
+        return Vec::new();
+    }
+    let count = read_u32(export_rva + 20).unwrap_or(0).min(100_000);
+    let table = read_u32(export_rva + 28).unwrap_or(0) as u64;
+    (0..count)
+        .filter_map(|i| read_u32(table + i as u64 * 4))
+        .filter(|rva| *rva != 0)
+        .map(|rva| rva as u64)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -465,7 +507,12 @@ fn try_parse_imports(
             };
 
             if !func_name.is_empty() {
-                map.insert(iat_va, format!("__imp_{}", func_name));
+                let symbol = if func_name.starts_with('?') || func_name.contains('@') {
+                    format!("__imp_{func_name}")
+                } else {
+                    format!("__imp__{func_name}")
+                };
+                map.insert(iat_va, symbol);
             }
             entry_idx += 1;
         }

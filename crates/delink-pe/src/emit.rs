@@ -121,12 +121,6 @@ pub fn emit_pe_cu(
         .filter(|f| f.size > 0 && text_section.contains_va(f.va))
         .collect();
 
-    if live.is_empty() {
-        return Err(anyhow!(
-            "module '{}' has no functions inside .text",
-            cu.name
-        ));
-    }
     live.sort_by_key(|f| f.va);
 
     let coff_arch = match pe.arch {
@@ -238,7 +232,7 @@ pub fn emit_pe_cu(
                     SymbolScope::Compilation
                 };
                 let sym_id = obj.add_symbol(Symbol {
-                    name: sanitize_symbol_name(&f.name),
+                    name: sanitize_symbol_name(&coff_function_name(&f.name)),
                     value: fn_offset,
                     size: out_bytes.len() as u64,
                     kind: SymbolKind::Text,
@@ -268,7 +262,7 @@ pub fn emit_pe_cu(
                         SymbolScope::Compilation
                     };
                     let label_id = obj.add_symbol(Symbol {
-                        name: sanitize_symbol_name(&var.name),
+                        name: sanitize_symbol_name(&coff_function_name(&var.name)),
                         value: fn_offset + remap_after_strip(var_va - f.va, &f3),
                         size: 0,
                         kind: SymbolKind::Label,
@@ -395,7 +389,7 @@ pub fn emit_pe_cu(
                     SymbolScope::Compilation
                 };
                 let sym_id = obj.add_symbol(Symbol {
-                    name: sanitize_symbol_name(&f.name),
+                    name: sanitize_symbol_name(&coff_function_name(&f.name)),
                     value: fn_offset,
                     size: out_bytes.len() as u64,
                     kind: SymbolKind::Text,
@@ -425,7 +419,7 @@ pub fn emit_pe_cu(
                         SymbolScope::Compilation
                     };
                     let label_id = obj.add_symbol(Symbol {
-                        name: sanitize_symbol_name(&var.name),
+                        name: sanitize_symbol_name(&coff_function_name(&var.name)),
                         value: fn_offset + remap_after_strip(var_va - f.va, &f3),
                         size: 0,
                         kind: SymbolKind::Label,
@@ -453,18 +447,22 @@ pub fn emit_pe_cu(
 
                 for r in &recovery.relocs {
                     let sym_id = resolve_symbol(&mut obj, &local_syms, &mut undef_cache, &r.target);
+                    let (typ, addend) = match r.kind {
+                        delink_x86::RelocKind::Rel32 => {
+                            (REL_I386_REL32, r.addend - REL32_FIELD_BYTES)
+                        }
+                        delink_x86::RelocKind::Dir32 => (REL_I386_DIR32, r.addend),
+                    };
                     obj.add_relocation(
                         sid,
                         Relocation {
                             offset: fn_offset + remap_after_strip(r.offset, &f3),
                             symbol: sym_id,
-                            addend: r.addend - REL32_FIELD_BYTES,
-                            flags: RelocationFlags::Coff {
-                                typ: REL_I386_REL32,
-                            },
+                            addend,
+                            flags: RelocationFlags::Coff { typ },
                         },
                     )
-                    .with_context(|| format!("add rel32 reloc at {:#x}", r.offset))?;
+                    .with_context(|| format!("add x86 reloc at {:#x}", r.offset))?;
                     total_relocs += 1;
                 }
             }
@@ -481,7 +479,37 @@ pub fn emit_pe_cu(
         .iter()
         .filter(|c| c.section_name != ".text")
     {
-        let Some(pe_section) = pe.sections.iter().find(|s| s.name == contrib.section_name) else {
+        let pe_section = pe
+            .sections
+            .iter()
+            .find(|s| s.name == contrib.section_name && s.contains_va(contrib.va))
+            .or_else(|| pe.sections.iter().find(|s| s.contains_va(contrib.va)));
+        let Some(pe_section) = pe_section else {
+            if contrib.section_name == ".bss" {
+                let data_sid =
+                    obj.add_section(Vec::new(), b".bss".to_vec(), SectionKind::UninitializedData);
+                obj.section_mut(data_sid).append_bss(contrib.size as u64, 1);
+                for (var_va, var) in pe
+                    .symbols
+                    .variables
+                    .range(contrib.va..contrib.va + contrib.size as u64)
+                {
+                    obj.add_symbol(Symbol {
+                        name: sanitize_symbol_name(&coff_function_name(&var.name)),
+                        value: var_va - contrib.va,
+                        size: var.size as u64,
+                        kind: SymbolKind::Data,
+                        scope: if var.is_public {
+                            SymbolScope::Dynamic
+                        } else {
+                            SymbolScope::Compilation
+                        },
+                        weak: false,
+                        section: SymbolSection::Section(data_sid),
+                        flags: SymbolFlags::None,
+                    });
+                }
+            }
             continue;
         };
 
@@ -582,7 +610,7 @@ pub fn emit_pe_cu(
                 SymbolScope::Compilation
             };
             obj.add_symbol(Symbol {
-                name: sanitize_symbol_name(&var.name),
+                name: sanitize_symbol_name(&coff_function_name(&var.name)),
                 value: offset,
                 size: 0,
                 kind: SymbolKind::Data,
@@ -776,7 +804,7 @@ pub fn emit_pe_shared(pe: &PeContext, out_path: &Path) -> Result<SharedDataStats
             SymbolScope::Compilation
         };
         obj.add_symbol(Symbol {
-            name: sanitize_symbol_name(&var.name),
+            name: sanitize_symbol_name(&coff_function_name(&var.name)),
             value: section_offset,
             size: 0,
             kind: SymbolKind::Data,
@@ -816,10 +844,9 @@ pub fn split_all_pe(
         .cu_index
         .units
         .par_iter()
-        .filter(|cu| cu.functions.iter().any(|f| f.size > 0))
+        .filter(|cu| cu.functions.iter().any(|f| f.size > 0) || !cu.contributions.is_empty())
         .map(|cu| {
-            let stem = sanitize_file_stem(&cu.name);
-            let file = out_dir.join(format!("{:04}_{stem}.obj", cu.id));
+            let file = out_dir.join(&cu.obj_file);
             let result = emit_pe_cu(pe, cu, &file, replace_rep_ret).map_err(|e| format!("{e:#}"));
             CuOutcome {
                 cu_name: cu.name.clone(),
@@ -845,7 +872,7 @@ fn resolve_symbol(
     if let Some(id) = local.get(name) {
         return *id;
     }
-    resolve_or_add_undef(obj, undef, name)
+    resolve_or_add_undef(obj, undef, &coff_function_name(name))
 }
 
 /// Emit each folded-public alias of `f` (extra S_PUB32 names at the same VA,
@@ -865,7 +892,7 @@ fn emit_alias_symbols(
             continue;
         }
         let id = obj.add_symbol(Symbol {
-            name: sanitize_symbol_name(alias),
+            name: sanitize_symbol_name(&coff_function_name(alias)),
             value: fn_offset,
             size,
             kind: SymbolKind::Text,
@@ -909,15 +936,14 @@ fn sanitize_symbol_name(name: &str) -> Vec<u8> {
     name.as_bytes().to_vec()
 }
 
-/// Sanitize a PDB module name (full path) into a filesystem-safe stem.
-fn sanitize_file_stem(name: &str) -> String {
-    // Take only the final path component, strip any extension.
-    let basename = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    let stem = match basename.rfind('.') {
-        Some(i) => &basename[..i],
-        None => basename,
-    };
-    stem.to_string()
+/// Map an undecorated analysis name to the x86 MSVC cdecl COFF spelling.
+/// C++-mangled and already-decorated names must remain unchanged.
+fn coff_function_name(name: &str) -> String {
+    if name.starts_with('?') || name.starts_with("__imp_") || name.contains('@') {
+        name.to_string()
+    } else {
+        format!("_{name}")
+    }
 }
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {

@@ -98,7 +98,13 @@ enum Cmd {
         input: PathBuf,
         /// Path to the matching PDB file.
         #[arg(long)]
-        pdb: PathBuf,
+        pdb: Option<PathBuf>,
+        /// Existing editable symbol manifest.
+        #[arg(long)]
+        symbols: Option<PathBuf>,
+        /// Existing editable split manifest.
+        #[arg(long)]
+        splits: Option<PathBuf>,
         /// Output directory for the `.obj` files.
         #[arg(short, long)]
         outdir: PathBuf,
@@ -235,9 +241,18 @@ fn main() -> Result<()> {
         Cmd::PeSplit {
             input,
             pdb,
+            symbols,
+            splits,
             outdir,
             replace_rep_ret,
-        } => cmd_pe_split(&input, &pdb, &outdir, replace_rep_ret),
+        } => cmd_pe_split(
+            &input,
+            pdb.as_deref(),
+            symbols.as_deref(),
+            splits.as_deref(),
+            &outdir,
+            replace_rep_ret,
+        ),
         Cmd::MachoInspect { input } => cmd_macho_inspect(&input),
         Cmd::MachoListCus {
             input,
@@ -988,12 +1003,332 @@ fn cmd_macho_split(
 
 fn cmd_pe_split(
     exe_path: &Path,
-    pdb_path: &Path,
+    pdb_path: Option<&Path>,
+    symbols_path: Option<&Path>,
+    splits_path: Option<&Path>,
     outdir: &Path,
     replace_rep_ret: bool,
 ) -> Result<()> {
-    let pe = load_pe_context(exe_path, pdb_path)?;
+    if let Some(pdb_path) = pdb_path {
+        let pe = load_pe_context(exe_path, pdb_path)?;
+        return cmd_pe_split_pdb(&pe, outdir, replace_rep_ret);
+    }
 
+    let exe_data =
+        std::fs::read(exe_path).with_context(|| format!("read {}", exe_path.display()))?;
+    let image = delink_pe::load_pe_image(&exe_data)
+        .with_context(|| format!("load {}", exe_path.display()))?;
+    let (mut pe, mut manifest) = delink_pe::analysis::analyze(&image)?;
+    if let Some(symbols_path) = symbols_path.filter(|path| path.is_file()) {
+        apply_symbol_overrides(&mut pe, &mut manifest, symbols_path)?;
+    }
+    if let Some(splits_path) = splits_path.filter(|path| path.is_file()) {
+        apply_split_overrides(&mut pe, splits_path)?;
+    }
+    std::fs::create_dir_all(outdir).with_context(|| format!("create {}", outdir.display()))?;
+    write_analysis_manifests(outdir, &manifest, &pe.cu_index)?;
+    tracing::info!(
+        "analysis mode: emitting {} inferred functions",
+        pe.cu_index.units.len()
+    );
+    let outcomes = delink_pe::emit::split_all_pe(&pe, outdir, replace_rep_ret)?;
+    let shared = outdir.join("__shared_data.obj");
+    let shared_stats = delink_pe::emit::emit_pe_shared(&pe, &shared)?;
+    let failures = outcomes.iter().filter(|o| o.result.is_err()).count();
+    println!(
+        "pe-split analysis complete: {} functions ({} failed), shared: rdata={} data={} bss={}",
+        outcomes.len().saturating_sub(failures),
+        failures,
+        shared_stats.rdata_bytes,
+        shared_stats.data_bytes,
+        shared_stats.bss_bytes
+    );
+    Ok(())
+}
+
+fn apply_symbol_overrides(
+    pe: &mut delink_pe::PeContext,
+    manifest: &mut delink_pe::AnalysisOutput,
+    path: &Path,
+) -> Result<()> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read symbols override {}", path.display()))?;
+    let mut overrides = std::collections::HashMap::new();
+    for line in text.lines().skip(1) {
+        let fields: Vec<_> = line.splitn(4, ',').map(str::trim).collect();
+        if fields.len() != 4 {
+            continue;
+        }
+        let Ok(address) = u64::from_str_radix(fields[0].trim_start_matches("0x"), 16) else {
+            continue;
+        };
+        let size = u32::from_str_radix(fields[1].trim_start_matches("0x"), 16).unwrap_or(0);
+        let symbol_type = fields[2].to_string();
+        if !matches!(symbol_type.as_str(), "func" | "data" | "imp") {
+            continue;
+        }
+        let section = match symbol_type.as_str() {
+            "func" => ".text",
+            "imp" => ".idata",
+            _ => ".data",
+        };
+        overrides.insert(
+            address,
+            (
+                fields[3].to_string(),
+                section.to_string(),
+                size,
+                symbol_type,
+            ),
+        );
+    }
+    for (address, (name, section, size, symbol_type)) in overrides {
+        let emitted_name = if symbol_type == "imp" && !name.starts_with("__imp_") {
+            format!("__imp_{}", decorate_override_name(&name))
+        } else {
+            decorate_override_name(&name)
+        };
+        if let Some(import) = pe.imports.get_mut(&address) {
+            *import = format!("__imp_{emitted_name}");
+        }
+        if let Some(import) = pe.symbols.imports.get_mut(&address) {
+            *import = format!("__imp_{emitted_name}");
+        }
+        if symbol_type == "import" {
+            let undecorated = format!("__imp_{}", name);
+            for import in pe.imports.values_mut() {
+                if *import == undecorated || import.ends_with(&name) {
+                    *import = format!("__imp_{emitted_name}");
+                }
+            }
+            for import in pe.symbols.imports.values_mut() {
+                if *import == undecorated || import.ends_with(&name) {
+                    *import = format!("__imp_{emitted_name}");
+                }
+            }
+        }
+        if let Some(function) = pe.symbols.functions.get_mut(&address) {
+            function.name = emitted_name.clone();
+            if size != 0 {
+                function.size = size;
+            }
+        }
+        if let Some(variable) = pe.symbols.variables.get_mut(&address) {
+            variable.name = name.clone();
+            if size != 0 {
+                variable.size = size;
+            }
+        }
+        for unit in &mut pe.cu_index.units {
+            for function in &mut unit.functions {
+                if function.va == address {
+                    function.name = emitted_name.clone();
+                    if size != 0 {
+                        function.size = size;
+                    }
+                }
+            }
+        }
+        if symbol_type != "function" && !pe.symbols.variables.contains_key(&address) {
+            pe.symbols.variables.insert(
+                address,
+                delink_pe::PeVariable {
+                    name: name.clone(),
+                    va: address,
+                    is_public: true,
+                    size,
+                },
+            );
+        }
+        if let Some(symbol) = manifest
+            .symbols
+            .iter_mut()
+            .find(|symbol| symbol.address == address)
+        {
+            symbol.name = name;
+            if size != 0 {
+                symbol.size = size as u64;
+            }
+        } else if symbol_type == "func" {
+            let function = delink_pe::PeFunction {
+                name: emitted_name.clone(),
+                va: address,
+                size,
+                is_public: true,
+                module_id: 0,
+                aliases: Vec::new(),
+            };
+            pe.symbols.functions.insert(address, function.clone());
+            let id = pe.cu_index.units.len();
+            pe.cu_index.units.push(delink_pe::PeCompilationUnit {
+                id,
+                name: name.clone(),
+                obj_file: format!("{:04}_{name}.obj", id),
+                functions: vec![function],
+                contributions: Vec::new(),
+            });
+            manifest.symbols.push(delink_pe::AnalysisSymbol {
+                name,
+                section,
+                address,
+                size: size as u64,
+                symbol_type: "function".to_string(),
+                scope: "global".to_string(),
+                data: None,
+            });
+        } else {
+            pe.symbols.variables.insert(
+                address,
+                delink_pe::PeVariable {
+                    name: name.clone(),
+                    va: address,
+                    is_public: true,
+                    size,
+                },
+            );
+            manifest.symbols.push(delink_pe::AnalysisSymbol {
+                name,
+                section,
+                address,
+                size: size as u64,
+                symbol_type: "object".to_string(),
+                scope: "global".to_string(),
+                data: None,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn decorate_override_name(name: &str) -> String {
+    if name.starts_with('?') || name.starts_with("__imp_") || name.contains('@') {
+        return name.to_string();
+    }
+    format!("_{name}")
+}
+
+fn apply_split_overrides(pe: &mut delink_pe::PeContext, path: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read splits override {}", path.display()))?;
+    let mut groups: Vec<(String, Vec<(String, u64, u64, Option<String>)>)> = Vec::new();
+    let mut current: Option<usize> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "Sections:" {
+            continue;
+        }
+        if !line.starts_with(' ') && trimmed.ends_with(':') {
+            groups.push((trimmed.trim_end_matches(':').to_string(), Vec::new()));
+            current = Some(groups.len() - 1);
+            continue;
+        }
+        let Some(index) = current else { continue };
+        let mut values = trimmed.split_whitespace();
+        let Some(section) = values.next() else {
+            continue;
+        };
+        if !section.starts_with('.') {
+            continue;
+        }
+        let Some(start) = values.next().and_then(|value| value.strip_prefix("start:")) else {
+            continue;
+        };
+        let Some(end) = values.next().and_then(|value| value.strip_prefix("end:")) else {
+            continue;
+        };
+        let Ok(start) = u64::from_str_radix(start.trim_start_matches("0x"), 16) else {
+            continue;
+        };
+        let Ok(end) = u64::from_str_radix(end.trim_start_matches("0x"), 16) else {
+            continue;
+        };
+        let rename = values.find_map(|value| value.strip_prefix("rename:").map(str::to_string));
+        groups[index]
+            .1
+            .push((section.to_string(), start, end, rename));
+    }
+    if groups.is_empty() {
+        pe.cu_index.units.clear();
+        return Ok(());
+    }
+
+    let mut grouped: Vec<(String, Vec<delink_pe::PeFunction>)> = groups
+        .iter()
+        .map(|(name, _)| (name.clone(), Vec::new()))
+        .collect();
+    for function in pe.symbols.functions.values() {
+        let group = groups.iter().position(|(_, spans)| {
+            spans.iter().any(|(section, start, end, _)| {
+                section == ".text" && function.va >= *start && function.va < *end
+            })
+        });
+        if let Some(group) = group {
+            grouped[group].1.push(function.clone());
+        }
+    }
+    let units: Vec<delink_pe::PeCompilationUnit> = grouped
+        .into_iter()
+        .enumerate()
+        .filter(|(_, (name, functions))| {
+            !functions.is_empty()
+                || groups
+                    .iter()
+                    .find(|(group_name, _)| group_name == name)
+                    .map(|(_, spans)| spans.iter().any(|(section, _, _, _)| section != ".text"))
+                    .unwrap_or(false)
+        })
+        .map(|(id, (name, functions))| {
+            let obj_file = if matches!(
+                Path::new(&name).extension().and_then(|ext| ext.to_str()),
+                Some("c" | "cc" | "cpp" | "cxx")
+            ) {
+                Path::new(&name)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace(".cxx", ".obj")
+                    .replace(".cpp", ".obj")
+                    .replace(".cc", ".obj")
+                    .replace(".c", ".obj")
+            } else {
+                name.clone()
+            };
+            let contributions = groups
+                .iter()
+                .find(|(group_name, _)| group_name == &name)
+                .into_iter()
+                .flat_map(|(_, spans)| spans.iter())
+                .filter(|(section, _, _, _)| section != ".text")
+                .map(|(section, start, end, rename)| delink_pe::PeContrib {
+                    va: *start,
+                    size: (*end - *start) as u32,
+                    section_name: rename.clone().unwrap_or_else(|| section.clone()),
+                    characteristics: pe
+                        .sections
+                        .iter()
+                        .find(|candidate| candidate.name == rename.as_deref().unwrap_or(section))
+                        .map(|candidate| candidate.characteristics)
+                        .unwrap_or_else(|| match rename.as_deref().unwrap_or(section) {
+                            ".bss" => 0x8000_0000 | 0x0000_0080,
+                            ".data" => 0x8000_0000,
+                            _ => 0,
+                        }),
+                })
+                .collect();
+            delink_pe::PeCompilationUnit {
+                id,
+                name: obj_file.trim_end_matches(".obj").to_string(),
+                obj_file,
+                functions,
+                contributions,
+            }
+        })
+        .collect();
+    pe.cu_index = delink_pe::PeCuIndex { units };
+    Ok(())
+}
+
+fn cmd_pe_split_pdb(pe: &delink_pe::PeContext, outdir: &Path, replace_rep_ret: bool) -> Result<()> {
     tracing::info!(
         "splitting {} CUs (modules with functions) in parallel",
         pe.cu_index
@@ -1043,6 +1378,55 @@ fn cmd_pe_split(
         shared_stats.bss_bytes,
         shared_stats.addr64_relocs,
     );
+    Ok(())
+}
+
+fn write_analysis_manifests(
+    outdir: &Path,
+    manifest: &delink_pe::AnalysisOutput,
+    cu_index: &delink_pe::PeCuIndex,
+) -> Result<()> {
+    let mut symbols = String::from("Address,Size,Type,Symbol\n");
+    for s in &manifest.symbols {
+        let symbol_type = if s.section == ".idata" {
+            "imp"
+        } else if s.symbol_type == "function" {
+            "func"
+        } else {
+            "data"
+        };
+        symbols.push_str(&format!(
+            "0x{:08X},0x{:X},{},{}\n",
+            s.address, s.size, symbol_type, s.name
+        ));
+    }
+    std::fs::write(outdir.join("symbols.csv"), symbols)?;
+    let mut splits = String::from(
+        "Sections:\n    .text      type:code  align:16\n    .rdata     type:rodata align:16\n    .data      type:data align:16\n    .bss       type:bss align:16\n\n",
+    );
+    for unit in &cu_index.units {
+        splits.push_str(&format!("{}:\n", unit.obj_file));
+        for function in &unit.functions {
+            splits.push_str(&format!(
+                "    .text start:0x{:08X} end:0x{:08X}\n",
+                function.va,
+                function.va + u64::from(function.size),
+            ));
+        }
+    }
+    std::fs::write(outdir.join("splits.txt"), splits)?;
+    std::fs::write(
+        outdir.join("symbols.json"),
+        serde_json::to_vec_pretty(&manifest.symbols)?,
+    )?;
+    std::fs::write(
+        outdir.join("splits.json"),
+        serde_json::to_vec_pretty(&manifest.splits)?,
+    )?;
+    std::fs::write(
+        outdir.join("manifest.json"),
+        serde_json::to_vec_pretty(manifest)?,
+    )?;
     Ok(())
 }
 

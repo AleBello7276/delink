@@ -7,6 +7,28 @@
 
 A splitting tool for decompilation projects.
 
+## Xbox 360 MSVC decomp project
+
+The companion project targets the 32-bit x86 Microsoft MSVC host binaries from
+version `16.00.11886.00` and rebuilds them with the matching
+`16.00.11886.00` compiler and libraries.
+
+Install the project inputs as follows:
+
+- Target binaries in `360msvc-decomp/orig/16.00.11886.00/`.
+- The matching compiler, headers, CRT, and libraries in `360msvc-decomp/Compiler/`.
+- Rust, Python, Ninja, and a Windows MSVC build environment on `PATH`.
+
+Build delink and copy the binary to the decomp project's required location:
+
+```shell
+cargo build --release --bin delink
+copy target\release\delink.exe ..\360msvc-decomp\build\tools\delink.exe
+```
+
+The decomp project's normal `ninja` split rules require
+`build/tools/delink.exe`; they do not invoke Cargo or build delink implicitly.
+
 ## Supported Formats:
 - Shared Object (.so) files with DWARF
 - Mach-O STABS and SYMTAB
