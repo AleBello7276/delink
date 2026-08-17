@@ -146,7 +146,7 @@ pub fn recover<R: SymbolResolver>(
 
         // Recover absolute memory operands such as `cmp dword ptr [global], 0`.
         // These references are not necessarily present in the PE base-reloc table.
-        if insn.op0_kind() == OpKind::Memory
+        if (insn.op0_kind() == OpKind::Memory || insn.op1_kind() == OpKind::Memory)
             && insn.memory_base() == Register::None
             && insn.memory_index() == Register::None
             && insn.memory_displ_size() == 4
@@ -170,6 +170,26 @@ pub fn recover<R: SymbolResolver>(
                         addend,
                     });
                 }
+            }
+        }
+
+        // MOV reg, imm32 is also an absolute data reference when the immediate
+        // names a string, global, or IAT slot (for example `mov edi, 0x408B80`).
+        if insn.mnemonic() == Mnemonic::Mov
+            && insn.op0_kind() == OpKind::Register
+            && insn.op1_kind() == OpKind::Immediate32
+        {
+            let target_va = insn.immediate32() as u64;
+            if let Some((sym, addend)) = resolver.resolve_data(target_va) {
+                out.relocs.push(RecoveredReloc {
+                    // Register-immediate MOV encodings place the imm32 at the
+                    // end of the instruction.
+                    offset: insn_offset + insn_len - 4,
+                    pc,
+                    kind: RelocKind::Dir32,
+                    target: sym,
+                    addend,
+                });
             }
         }
 
