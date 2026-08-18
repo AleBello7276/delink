@@ -1083,11 +1083,7 @@ fn apply_symbol_overrides(
         );
     }
     for (address, (name, section, size, symbol_type)) in overrides {
-        let emitted_name = if symbol_type == "imp" {
-            name.clone()
-        } else {
-            decorate_override_name(&name)
-        };
+        let emitted_name = name.clone();
         if let Some(import) = pe.imports.get_mut(&address) {
             *import = emitted_name.clone();
         }
@@ -1185,13 +1181,6 @@ fn apply_symbol_overrides(
         }
     }
     Ok(())
-}
-
-fn decorate_override_name(name: &str) -> String {
-    if name.starts_with('?') || name.starts_with("__imp_") || name.contains('@') {
-        return name.to_string();
-    }
-    format!("_{name}")
 }
 
 fn apply_split_overrides(pe: &mut delink_pe::PeContext, path: &Path) -> Result<()> {
