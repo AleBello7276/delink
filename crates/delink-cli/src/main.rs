@@ -105,6 +105,10 @@ enum Cmd {
         /// Existing editable split manifest.
         #[arg(long)]
         splits: Option<PathBuf>,
+        /// Run the no-PDB x86 analysis instead of the config-driven split.
+        /// Emits raw analysis manifests (functions/strings/splits) for seeding.
+        #[arg(long)]
+        analyze: bool,
         /// Output directory for the `.obj` files.
         #[arg(short, long)]
         outdir: PathBuf,
@@ -243,6 +247,7 @@ fn main() -> Result<()> {
             pdb,
             symbols,
             splits,
+            analyze,
             outdir,
             replace_rep_ret,
         } => cmd_pe_split(
@@ -250,6 +255,7 @@ fn main() -> Result<()> {
             pdb.as_deref(),
             symbols.as_deref(),
             splits.as_deref(),
+            analyze,
             &outdir,
             replace_rep_ret,
         ),
@@ -1006,6 +1012,7 @@ fn cmd_pe_split(
     pdb_path: Option<&Path>,
     symbols_path: Option<&Path>,
     splits_path: Option<&Path>,
+    analyze: bool,
     outdir: &Path,
     replace_rep_ret: bool,
 ) -> Result<()> {
@@ -1018,12 +1025,35 @@ fn cmd_pe_split(
         std::fs::read(exe_path).with_context(|| format!("read {}", exe_path.display()))?;
     let image = delink_pe::load_pe_image(&exe_data)
         .with_context(|| format!("load {}", exe_path.display()))?;
-    let (mut pe, mut manifest) = delink_pe::analysis::analyze(&image)?;
-    if let Some(symbols_path) = symbols_path.filter(|path| path.is_file()) {
-        apply_symbol_overrides(&mut pe, &mut manifest, symbols_path)?;
+
+    // Config-driven split: build symbols/splits purely from the editable
+    // CSV/splits manifests. No x86 analysis runs, so no invented symbols such
+    // as `data_0041933F` leak into symbols.json / the emitted objects.
+    let config_symbols = symbols_path.filter(|path| path.is_file()).map(|p| p.to_path_buf());
+    let config_splits = splits_path.filter(|path| path.is_file()).map(|p| p.to_path_buf());
+    if !analyze {
+        if let Some(config) = config_symbols {
+            let (pe, manifest) = build_config_context(&image, &config, config_splits.as_deref())?;
+            std::fs::create_dir_all(outdir)
+                .with_context(|| format!("create {}", outdir.display()))?;
+            write_analysis_manifests(outdir, &manifest, &pe.cu_index)?;
+            tracing::info!(
+                "config mode: emitting {} units from manifests",
+                pe.cu_index.units.len()
+            );
+            let outcomes = delink_pe::emit::split_all_pe(&pe, outdir, replace_rep_ret)?;
+            return finish_pe_split(&pe, outdir, outcomes, false);
+        }
     }
-    if let Some(splits_path) = splits_path.filter(|path| path.is_file()) {
-        apply_split_overrides(&mut pe, splits_path)?;
+
+    let (mut pe, mut manifest) = delink_pe::analysis::analyze(&image)?;
+    if !analyze {
+        if let Some(symbols_path) = symbols_path.filter(|path| path.is_file()) {
+            apply_symbol_overrides(&mut pe, &mut manifest, symbols_path)?;
+        }
+        if let Some(splits_path) = splits_path.filter(|path| path.is_file()) {
+            apply_split_overrides(&mut pe, splits_path)?;
+        }
     }
     std::fs::create_dir_all(outdir).with_context(|| format!("create {}", outdir.display()))?;
     write_analysis_manifests(outdir, &manifest, &pe.cu_index)?;
@@ -1032,11 +1062,21 @@ fn cmd_pe_split(
         pe.cu_index.units.len()
     );
     let outcomes = delink_pe::emit::split_all_pe(&pe, outdir, replace_rep_ret)?;
+    finish_pe_split(&pe, outdir, outcomes, true)
+}
+
+fn finish_pe_split(
+    pe: &delink_pe::PeContext,
+    outdir: &Path,
+    outcomes: Vec<delink_pe::emit::CuOutcome>,
+    analysis: bool,
+) -> Result<()> {
     let shared = outdir.join("__shared_data.obj");
-    let shared_stats = delink_pe::emit::emit_pe_shared(&pe, &shared)?;
+    let shared_stats = delink_pe::emit::emit_pe_shared(pe, &shared)?;
     let failures = outcomes.iter().filter(|o| o.result.is_err()).count();
+    let label = if analysis { "analysis" } else { "config" };
     println!(
-        "pe-split analysis complete: {} functions ({} failed), shared: rdata={} data={} bss={}",
+        "pe-split {label} complete: {} functions ({} failed), shared: rdata={} data={} bss={}",
         outcomes.len().saturating_sub(failures),
         failures,
         shared_stats.rdata_bytes,
@@ -1044,6 +1084,132 @@ fn cmd_pe_split(
         shared_stats.bss_bytes
     );
     Ok(())
+}
+
+/// Build a `PeContext` + manifest purely from the config CSV/splits manifests.
+/// No x86 analysis runs: the symbols, sizes and CU grouping come entirely from
+/// the editable manifests, so invented names never leak into symbols.json.
+fn build_config_context(
+    image: &delink_pe::PeImage,
+    symbols_path: &Path,
+    splits_path: Option<&Path>,
+) -> Result<(delink_pe::PeContext, delink_pe::AnalysisOutput)> {
+    let text = std::fs::read_to_string(symbols_path)
+        .with_context(|| format!("read symbols config {}", symbols_path.display()))?;
+
+    let mut functions: std::collections::BTreeMap<u64, delink_pe::PeFunction> =
+        std::collections::BTreeMap::new();
+    let mut variables: std::collections::BTreeMap<u64, delink_pe::PeVariable> =
+        std::collections::BTreeMap::new();
+    let mut imports = image.imports.clone();
+    let mut symbols_manifest = Vec::new();
+
+    for line in text.lines().skip(1) {
+        let fields: Vec<_> = line.splitn(4, ',').map(str::trim).collect();
+        if fields.len() != 4 {
+            continue;
+        }
+        let Ok(address) = u64::from_str_radix(fields[0].trim_start_matches("0x"), 16) else {
+            continue;
+        };
+        let size = u32::from_str_radix(fields[1].trim_start_matches("0x"), 16).unwrap_or(0);
+        let name = fields[3].to_string();
+        let (section, symbol_type) = match fields[2] {
+            "func" => (".text", "function"),
+            "imp" => (".idata", "object"),
+            "data" => (".data", "object"),
+            _ => continue,
+        };
+        if let Some(import) = imports.get_mut(&address) {
+            *import = name.clone();
+        }
+        match fields[2] {
+            "func" => {
+                functions.insert(
+                    address,
+                    delink_pe::PeFunction {
+                        name: name.clone(),
+                        va: address,
+                        size,
+                        is_public: true,
+                        module_id: 0,
+                        aliases: Vec::new(),
+                    },
+                );
+            }
+            "data" => {
+                variables.insert(
+                    address,
+                    delink_pe::PeVariable {
+                        name: name.clone(),
+                        va: address,
+                        is_public: true,
+                        size,
+                    },
+                );
+            }
+            _ => {}
+        }
+        symbols_manifest.push(delink_pe::AnalysisSymbol {
+            name,
+            section: section.to_string(),
+            address,
+            size: size as u64,
+            symbol_type: symbol_type.to_string(),
+            scope: "global".to_string(),
+            data: None,
+        });
+    }
+
+    let symbols = delink_pe::PeGlobalSymbols::build(
+        functions.clone(),
+        variables,
+        std::collections::BTreeMap::new(),
+        std::collections::BTreeMap::new(),
+        &imports,
+        &image.sections,
+        image.image_base,
+    );
+
+    let mut pe = delink_pe::PeContext {
+        arch: image.arch,
+        image_base: image.image_base,
+        sections: image.sections.clone(),
+        cu_index: delink_pe::PeCuIndex { units: Vec::new() },
+        symbols,
+        base_relocations: image.base_relocations.clone(),
+        imports,
+        inlined_functions: Vec::new(),
+    };
+
+    if let Some(splits_path) = splits_path {
+        apply_split_overrides(&mut pe, splits_path)?;
+    }
+
+    let mut splits = Vec::new();
+    if let Some(splits_path) = splits_path {
+        for (object, spans) in parse_split_groups(splits_path)? {
+            splits.push(delink_pe::AnalysisSplit {
+                object,
+                spans: spans
+                    .into_iter()
+                    .map(|(section, start, end, _)| delink_pe::AnalysisSpan {
+                        section,
+                        start,
+                        end,
+                    })
+                    .collect(),
+            });
+        }
+    }
+
+    Ok((
+        pe,
+        delink_pe::AnalysisOutput {
+            symbols: symbols_manifest,
+            splits,
+        },
+    ))
 }
 
 fn apply_symbol_overrides(
@@ -1183,10 +1349,12 @@ fn apply_symbol_overrides(
     Ok(())
 }
 
-fn apply_split_overrides(pe: &mut delink_pe::PeContext, path: &Path) -> Result<()> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("read splits override {}", path.display()))?;
-    let mut groups: Vec<(String, Vec<(String, u64, u64, Option<String>)>)> = Vec::new();
+type SplitGroup = (String, Vec<(String, u64, u64, Option<String>)>);
+
+fn parse_split_groups(path: &Path) -> Result<Vec<SplitGroup>> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("read splits {}", path.display()))?;
+    let mut groups: Vec<SplitGroup> = Vec::new();
     let mut current: Option<usize> = None;
     for line in text.lines() {
         let trimmed = line.trim();
@@ -1219,10 +1387,13 @@ fn apply_split_overrides(pe: &mut delink_pe::PeContext, path: &Path) -> Result<(
             continue;
         };
         let rename = values.find_map(|value| value.strip_prefix("rename:").map(str::to_string));
-        groups[index]
-            .1
-            .push((section.to_string(), start, end, rename));
+        groups[index].1.push((section.to_string(), start, end, rename));
     }
+    Ok(groups)
+}
+
+fn apply_split_overrides(pe: &mut delink_pe::PeContext, path: &Path) -> Result<()> {
+    let groups = parse_split_groups(path)?;
     if groups.is_empty() {
         pe.cu_index.units.clear();
         return Ok(());
