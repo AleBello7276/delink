@@ -14,7 +14,7 @@ use object::{
     SymbolScope,
 };
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::cu::{PeCompilationUnit, PeFunction};
@@ -96,6 +96,60 @@ pub struct CuOutcome {
 // ---------------------------------------------------------------------------
 // Per-CU emit
 // ---------------------------------------------------------------------------
+
+/// Scan a data byte range for absolute pointers and stage a DIR32/ADDR64
+/// relocation for each that falls inside the image address space and resolves
+/// to a named symbol. Offsets already covered by the base-reloc pass (`covered`)
+/// are skipped. The pointer stride equals the architecture's pointer width.
+///
+/// This catches initialized pointer arrays (e.g. a `{ const wchar_t*, int* }`
+/// table) whose entries the linker did not record in `.reloc`, so they would
+/// otherwise be emitted as raw bytes and never match the recompiled object.
+fn stage_data_pointer_relocs(
+    pe: &PeContext,
+    bytes: &mut [u8],
+    pointer_width: usize,
+    abs_reloc_typ: u16,
+    covered: &HashSet<usize>,
+    obj: &mut Object,
+    undef_cache: &mut HashMap<String, SymbolId>,
+    staged: &mut Vec<(u64, SymbolId, i64, u16)>,
+) -> Result<()> {
+    let image_end = pe
+        .sections
+        .iter()
+        .map(|s| s.va + s.virtual_size)
+        .max()
+        .unwrap_or(pe.image_base);
+    for off in (0..bytes.len()).step_by(pointer_width) {
+        let Some(chunk) = bytes.get(off..off + pointer_width) else {
+            break;
+        };
+        if covered.contains(&off) {
+            continue;
+        }
+        let target_va: u64 = match pointer_width {
+            8 => u64::from_le_bytes(chunk.try_into().unwrap()),
+            _ => u32::from_le_bytes(chunk.try_into().unwrap()) as u64,
+        };
+        if target_va < pe.image_base || target_va >= image_end {
+            continue;
+        }
+        // Only relocate to a genuinely named symbol; synthetic section-relative
+        // markers (`__delink_pe_*`) are skipped so we never invent references
+        // that the recompiled object won't have.
+        let Some((sym_name, addend)) = pe.symbols.resolve_data(target_va) else {
+            continue;
+        };
+        if sym_name.starts_with("__delink_pe_") {
+            continue;
+        }
+        bytes[off..off + pointer_width].fill(0);
+        let sym = resolve_or_add_undef(obj, undef_cache, &sym_name);
+        staged.push((off as u64, sym, addend, abs_reloc_typ));
+    }
+    Ok(())
+}
 
 /// Emit one COFF `.obj` for `cu`, writing to `out_path`.
 ///
@@ -579,6 +633,22 @@ pub fn emit_pe_cu(
                     staged_data.push((off as u64, sym, addend, abs_reloc_typ));
                 }
             }
+
+            // Heuristic fallback: pointer-array structs whose entries the
+            // linker did not record in `.reloc` are scanned for address-like
+            // words that resolve to a named symbol.
+            let covered: HashSet<usize> =
+                staged_data.iter().map(|(o, _, _, _)| *o as usize).collect();
+            stage_data_pointer_relocs(
+                &pe,
+                &mut contrib_bytes,
+                pointer_width,
+                abs_reloc_typ,
+                &covered,
+                &mut obj,
+                &mut undef_cache,
+                &mut staged_data,
+            )?;
 
             section_base = obj.append_section_data(data_sid, &contrib_bytes, 1);
 
